@@ -1,0 +1,52 @@
+##########################################################################
+# If you edit this file, delete sdkconfig to force a rebuild from defaults.
+##########################################################################
+
+#
+# Target: ESP32-S3
+#
+CONFIG_IDF_TARGET="esp32s3"
+
+#
+# Flash
+#
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+
+#
+# PSRAM (Octal / OPI PSRAM)
+#
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_CAPS_ALLOC=y
+CONFIG_SPIRAM_ALLOW_BSS_SEG_EXTERNAL_MEMORY=y
+
+#
+# CPU
+#
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ=240
+
+#
+# FreeRTOS
+#
+CONFIG_FREERTOS_HZ=1000
+
+#
+# Partition table
+#
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+#
+# USB (for flashing and monitor via USB)
+#
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+#
+# Log level
+#
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+CONFIG_LOG_MAXIMUM_LEVEL_INFO=y
