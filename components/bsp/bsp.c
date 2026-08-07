@@ -17,6 +17,10 @@ static const char *TAG = "bsp";
 /* I2C0 bus handle — created once, used by the scanner and peripherals */
 static i2c_master_bus_handle_t s_i2c0_handle = NULL;
 
+/* I2C device handles for onboard sensors */
+static i2c_master_dev_handle_t s_rtc_dev    = NULL;
+static i2c_master_dev_handle_t s_sht4x_dev  = NULL;
+
 /* ==========================================================================
  * I2C0 helpers (new driver API — ESP-IDF v6)
  * ========================================================================== */
@@ -317,6 +321,91 @@ esp_err_t bsp_battery_read_mv(uint32_t *voltage_mv)
 }
 
 /* ==========================================================================
+ * PCF8563 RTC
+ * ========================================================================== */
+
+/* BCD ↔ decimal */
+static inline uint8_t bcd2dec(uint8_t bcd) { return ((bcd >> 4) * 10U) + (bcd & 0x0FU); }
+
+static inline uint8_t dec2bcd(uint8_t dec) { return ((dec / 10U) << 4) | (dec % 10U); }
+
+esp_err_t bsp_rtc_set_time(const bsp_rtc_time_t *time)
+{
+    if (!time)      return ESP_ERR_INVALID_ARG;
+    if (!s_rtc_dev) return ESP_ERR_NOT_FOUND;
+
+    /* Write 7 registers starting at 0x02: sec, min, hr, day, wday(0), month, year */
+    uint8_t buf[8];
+    buf[0] = 0x02;                                  /* register address */
+    buf[1] = dec2bcd((uint8_t)time->second);         /* seconds, VL=0 */
+    buf[2] = dec2bcd((uint8_t)time->minute);
+    buf[3] = dec2bcd((uint8_t)time->hour);
+    buf[4] = dec2bcd((uint8_t)time->day);
+    buf[5] = 0x00;                                   /* weekday (unused) */
+    buf[6] = dec2bcd((uint8_t)time->month);          /* century bit 0 → 2000s */
+    buf[7] = dec2bcd((uint8_t)(time->year % 100));
+
+    return i2c_master_transmit(s_rtc_dev, buf, sizeof(buf), 10);
+}
+
+esp_err_t bsp_rtc_read_time(bsp_rtc_time_t *time)
+{
+    if (!time)    return ESP_ERR_INVALID_ARG;
+    if (!s_rtc_dev) return ESP_ERR_NOT_FOUND;
+
+    /* Burst-read 7 registers starting at 0x02 (seconds) */
+    uint8_t reg_addr = 0x02;
+    uint8_t raw[7]   = {0};
+
+    esp_err_t ret = i2c_master_transmit_receive(
+        s_rtc_dev, &reg_addr, 1, raw, sizeof(raw), 10);
+    if (ret != ESP_OK) return ret;
+
+    time->voltage_ok = (raw[0] & 0x80U) == 0U;
+    time->second     = bcd2dec(raw[0] & 0x7FU);
+    time->minute     = bcd2dec(raw[1] & 0x7FU);
+    time->hour       = bcd2dec(raw[2] & 0x3FU);
+    time->day        = bcd2dec(raw[3] & 0x3FU);
+    time->month      = bcd2dec(raw[5] & 0x1FU);
+    time->year       = 2000 + bcd2dec(raw[6]);
+
+    return ESP_OK;
+}
+
+/* ==========================================================================
+ * SHT4x temperature / humidity sensor
+ * ========================================================================== */
+
+esp_err_t bsp_sht4x_read(float *temp_c, float *humidity_pct)
+{
+    if (!temp_c || !humidity_pct) return ESP_ERR_INVALID_ARG;
+    if (!s_sht4x_dev)             return ESP_ERR_NOT_FOUND;
+
+    /* Step 1: send measurement command (0xFD) — STOP after write */
+    uint8_t cmd = 0xFD;
+    esp_err_t ret = i2c_master_transmit(s_sht4x_dev, &cmd, 1, 10);
+    if (ret != ESP_OK) return ret;
+
+    /* Step 2: wait for measurement (8.3 ms for high precision) */
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Step 3: read 6 bytes */
+    uint8_t data[6] = {0};
+    ret = i2c_master_receive(s_sht4x_dev, data, sizeof(data), 10);
+    if (ret != ESP_OK) return ret;
+
+    uint16_t t_ticks  = ((uint16_t)data[0] << 8) | data[1];
+    uint16_t rh_ticks = ((uint16_t)data[3] << 8) | data[4];
+
+    *temp_c       = -45.0f + 175.0f * ((float)t_ticks / 65535.0f);
+    *humidity_pct =  -6.0f + 125.0f * ((float)rh_ticks / 65535.0f);
+    if (*humidity_pct > 100.0f) *humidity_pct = 100.0f;
+    if (*humidity_pct < 0.0f)   *humidity_pct = 0.0f;
+
+    return ESP_OK;
+}
+
+/* ==========================================================================
  * Full init
  * ========================================================================== */
 
@@ -332,6 +421,20 @@ esp_err_t bsp_init(void)
     /* --- I2C0 --- */
     step = bsp_i2c0_init();
     if (step != ESP_OK) { ESP_LOGE(TAG, "I2C0 init failed"); ret = step; }
+
+    /* --- I2C sensor device handles --- */
+    if (s_i2c0_handle) {
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .scl_speed_hz    = BSP_I2C_CLK_FAST,
+        };
+
+        dev_cfg.device_address = BSP_I2C_ADDR_PCF8563;
+        i2c_master_bus_add_device(s_i2c0_handle, &dev_cfg, &s_rtc_dev);
+
+        dev_cfg.device_address = BSP_I2C_ADDR_SHT4X;
+        i2c_master_bus_add_device(s_i2c0_handle, &dev_cfg, &s_sht4x_dev);
+    }
 
     /* --- LED --- */
     gpio_config_t led = {

@@ -188,6 +188,48 @@ esp_err_t bsp_battery_init(void);
  */
 esp_err_t bsp_battery_read_mv(uint32_t *voltage_mv);
 
+/* ==========================================================================
+ * Onboard sensors
+ * ========================================================================== */
+
+/**
+ * @brief RTC time struct (PCF8563).
+ */
+typedef struct {
+    int  year;       /* full year (e.g. 2026) */
+    int  month;      /* 1–12 */
+    int  day;        /* 1–31 */
+    int  hour;       /* 0–23 */
+    int  minute;     /* 0–59 */
+    int  second;     /* 0–59 */
+    bool voltage_ok; /* false = VL flag set, battery drained, time unreliable */
+} bsp_rtc_time_t;
+
+/**
+ * @brief Set the PCF8563 RTC time.
+ *
+ * @param[in]  time  New time to write (year in 2000–2099 range).
+ * @return ESP_OK, ESP_ERR_NOT_FOUND if RTC is unreachable, or an I2C error.
+ */
+esp_err_t bsp_rtc_set_time(const bsp_rtc_time_t *time);
+
+/**
+ * @brief Read the current time from the PCF8563 RTC.
+ *
+ * @param[out] time  Populated with the RTC time on success.
+ * @return ESP_OK, ESP_ERR_NOT_FOUND if RTC is unreachable, or an I2C error.
+ */
+esp_err_t bsp_rtc_read_time(bsp_rtc_time_t *time);
+
+/**
+ * @brief Read temperature and humidity from the SHT4x sensor.
+ *
+ * @param[out] temp_c       Temperature in degrees Celsius.
+ * @param[out] humidity_pct Relative humidity in percent (0–100).
+ * @return ESP_OK, ESP_ERR_NOT_FOUND if sensor is unreachable, or an I2C error.
+ */
+esp_err_t bsp_sht4x_read(float *temp_c, float *humidity_pct);
+
 #ifdef __cplusplus
 }
 #endif

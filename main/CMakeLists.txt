@@ -5,5 +5,9 @@ idf_component_register(
         "."
     REQUIRES
         bsp
+        esp_netif
+        esp_psram
+        esp_wifi
+        nvs_flash
         spi_flash
 )
