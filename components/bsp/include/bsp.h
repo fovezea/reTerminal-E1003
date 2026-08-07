@@ -208,6 +208,31 @@ esp_err_t bsp_battery_init(void);
 esp_err_t bsp_battery_read_mv(uint32_t *voltage_mv);
 
 /* ==========================================================================
+ * Power management
+ * ========================================================================== */
+
+/**
+ * @brief Power down all peripherals before entering deep sleep.
+ *
+ * Turns off display power, SD card, I2C bus, LED, and sets GPIOs to
+ * low-leakage state.  Call before esp_deep_sleep_start().
+ */
+void bsp_power_down(void);
+
+/**
+ * @brief Enter deep sleep with timer and/or GPIO wake-up.
+ *
+ * @param sleep_sec   Wake after this many seconds (0 = no timer wake).
+ * @param btn_wake    If true, KEY0 (GPIO3, active LOW) will also wake.
+ */
+void bsp_deep_sleep_enter(uint32_t sleep_sec, bool btn_wake);
+
+/**
+ * @brief Return a human-readable string describing the last wake cause.
+ */
+const char *bsp_wake_cause_str(void);
+
+/* ==========================================================================
  * Onboard sensors
  * ========================================================================== */
 

@@ -24,6 +24,7 @@ static i2c_master_bus_handle_t s_i2c0_handle = NULL;
 /* I2C device handles for onboard sensors */
 static i2c_master_dev_handle_t s_rtc_dev    = NULL;
 static i2c_master_dev_handle_t s_sht4x_dev  = NULL;
+static spi_device_handle_t     s_spi_disp   = NULL;
 
 /* ==========================================================================
  * I2C0 helpers (new driver API — ESP-IDF v6)
@@ -297,6 +298,79 @@ esp_err_t bsp_battery_read_mv(uint32_t *voltage_mv)
 }
 
 /* ==========================================================================
+ * Power management
+ * ========================================================================== */
+
+#include "esp_sleep.h"
+
+void bsp_power_down(void)
+{
+    ESP_LOGI(TAG, "Powering down peripherals ...");
+
+    /* Display power OFF (active-low: HIGH = off) */
+    gpio_set_level(BSP_DISP_DC, 1);
+    gpio_set_level(BSP_DISP_VCC_EN, 1);
+
+    /* SD card power OFF */
+    gpio_set_level(BSP_SD_PWR_EN, 0);
+
+    /* LED OFF */
+    BSP_LED_OFF();
+
+    /* I2C — remove devices first, then delete the bus */
+    if (s_rtc_dev)   { i2c_master_bus_rm_device(s_rtc_dev);   s_rtc_dev   = NULL; }
+    if (s_sht4x_dev) { i2c_master_bus_rm_device(s_sht4x_dev); s_sht4x_dev = NULL; }
+    if (s_i2c0_handle) {
+        i2c_del_master_bus(s_i2c0_handle);
+        s_i2c0_handle = NULL;
+    }
+
+    /* SPI */
+    if (s_spi_disp) {
+        spi_bus_remove_device(s_spi_disp);
+        s_spi_disp = NULL;
+        spi_bus_free(SPI2_HOST);
+    }
+
+    /* Buzzer */
+    gpio_set_level(BSP_BUZZER_PIN, 0);
+
+    /* Mic power OFF */
+    gpio_set_level(BSP_MIC_PWR_EN, 0);
+
+    ESP_LOGI(TAG, "Peripherals powered down.");
+}
+
+void bsp_deep_sleep_enter(uint32_t sleep_sec, bool btn_wake)
+{
+    if (sleep_sec > 0) {
+        ESP_LOGI(TAG, "Deep sleep for %lu s ...", (unsigned long)sleep_sec);
+        esp_sleep_enable_timer_wakeup(sleep_sec * 1000000ULL);
+    }
+
+    if (btn_wake) {
+        /* KEY0 = GPIO3, wake on LOW level */
+        esp_sleep_enable_ext1_wakeup(1ULL << BSP_BTN_KEY0, ESP_EXT1_WAKEUP_ANY_LOW);
+        ESP_LOGI(TAG, "Button wake enabled (GPIO%d)", BSP_BTN_KEY0);
+    }
+
+    bsp_power_down();
+    vTaskDelay(pdMS_TO_TICKS(50));
+    esp_deep_sleep_start();
+}
+
+const char *bsp_wake_cause_str(void)
+{
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    switch (cause) {
+    case ESP_SLEEP_WAKEUP_TIMER:     return "timer";
+    case ESP_SLEEP_WAKEUP_EXT1:      return "button (KEY0)";
+    case ESP_SLEEP_WAKEUP_UNDEFINED: return "power-on / reset";
+    default:                         return "unknown";
+    }
+}
+
+/* ==========================================================================
  * PCF8563 RTC
  * ========================================================================== */
 
@@ -393,8 +467,6 @@ esp_err_t bsp_sht4x_read(float *temp_c, float *humidity_pct)
 #define IT8951_CMD_SYS_RUN    0x0001
 #define IT8951_CMD_REG_RD     0x0010
 #define IT8951_CMD_GET_DEV_INFO 0x0302
-
-static spi_device_handle_t s_spi_disp = NULL;
 
 /* Helper: wait for HRDY, return false on timeout */
 static bool it8951_wait_ready(int timeout_ms)
