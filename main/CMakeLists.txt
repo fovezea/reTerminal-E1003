@@ -3,4 +3,7 @@ idf_component_register(
         "main.c"
     INCLUDE_DIRS
         "."
+    REQUIRES
+        bsp
+        spi_flash
 )

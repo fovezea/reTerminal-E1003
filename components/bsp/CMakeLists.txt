@@ -1,0 +1,13 @@
+idf_component_register(
+    SRCS
+        "bsp.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        driver
+        esp_adc
+        esp_driver_gpio
+        esp_driver_i2c
+        freertos
+        hal
+)

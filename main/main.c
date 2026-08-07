@@ -5,16 +5,18 @@
 #include "esp_log.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
+#include "esp_psram.h"
+#include "bsp.h"
 
-static const char *TAG = "reTerminal-E1003";
+static const char *TAG = "app";
 
 void app_main(void)
 {
     esp_chip_info_t chip_info;
     esp_chip_info(&chip_info);
 
-    ESP_LOGI(TAG, "reTerminal E1003 – ESP-IDF v6");
-    ESP_LOGI(TAG, "Chip: %s, cores: %d, rev: %d",
+    ESP_LOGI(TAG, "reTerminal E1003 — ESP-IDF v6");
+    ESP_LOGI(TAG, "Target: %s | cores: %d | rev: %d",
              CONFIG_IDF_TARGET,
              chip_info.cores,
              chip_info.revision);
@@ -26,13 +28,34 @@ void app_main(void)
                  (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
     }
 
-    ESP_LOGI(TAG, "PSRAM: %s",
-             (chip_info.features & CHIP_FEATURE_EMB_PSRAM) ? "present" : "not detected");
+    size_t psram_size = esp_psram_get_size();
+    ESP_LOGI(TAG, "PSRAM: %s (%u MB)",
+             psram_size > 0 ? "present" : "not detected",
+             (unsigned)(psram_size >> 20));
 
-    for (int i = 10; i > 0; i--) {
-        ESP_LOGI(TAG, "Starting in %d...", i);
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    /* Initialise the board */
+    esp_err_t err = bsp_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "BSP init returned error: 0x%x", err);
     }
 
-    ESP_LOGI(TAG, "Hello, reTerminal E1003!");
+    /* Read battery */
+    uint32_t bat_mv = 0;
+    if (bsp_battery_read_mv(&bat_mv) == ESP_OK) {
+        ESP_LOGI(TAG, "Battery: %lu mV (%.2f V)",
+                 (unsigned long)bat_mv, bat_mv / 1000.0f);
+    }
+
+    /* Blink the LED a few times */
+    for (int i = 0; i < 3; i++) {
+        BSP_LED_ON();
+        vTaskDelay(pdMS_TO_TICKS(200));
+        BSP_LED_OFF();
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    ESP_LOGI(TAG, "Board ready — entering idle loop.");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(10000));
+    }
 }
