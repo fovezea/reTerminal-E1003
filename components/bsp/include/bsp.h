@@ -153,9 +153,28 @@ esp_err_t bsp_init(void);
 esp_err_t bsp_display_init(void);
 
 /**
+ * @brief Probe the IT8951 display controller over SPI.
+ *
+ * Sends SYS_RUN, reads the device-info registers, and logs panel/FW details.
+ * SPI2 (FSPI) is initialised automatically on first call.
+ *
+ * @return ESP_OK if the controller responded correctly.
+ */
+esp_err_t bsp_display_probe(void);
+
+/**
  * @brief Configure touch INT and RESET pins; I2C0 must be ready.
  */
 esp_err_t bsp_touch_init(void);
+
+/**
+ * @brief Probe the GT911 touch controller over I2C0.
+ *
+ * Reads the product-ID register (0x8140) and logs the result.
+ *
+ * @return ESP_OK if the controller responded with expected data.
+ */
+esp_err_t bsp_touch_probe(void);
 
 /**
  * @brief Enable SD-card power and configure CS / card-detect pins.

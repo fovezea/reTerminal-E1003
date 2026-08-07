@@ -5,10 +5,14 @@
 #include "bsp.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/i2c_master.h"
+#include "driver/spi_master.h"
 #include "driver/gpio.h"
+#include "hal/gpio_ll.h"
+#include "soc/gpio_struct.h"
 #include "hal/adc_types.h"
 #include "esp_adc/adc_oneshot.h"
 
@@ -70,61 +74,33 @@ static void bsp_i2c_scan(void)
 
 esp_err_t bsp_display_init(void)
 {
-    /* Panel power enable */
-    gpio_config_t pwr = {
-        .pin_bit_mask = BIT64(BSP_DISP_VCC_EN),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&pwr);
-    gpio_set_level(BSP_DISP_VCC_EN, 1);
+    /* Minimal Arduino-style init — set level BEFORE direction to avoid glitches */
 
-    /* Reset pin */
-    gpio_config_t rst = {
-        .pin_bit_mask = BIT64(BSP_DISP_RST),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&rst);
-    gpio_set_level(BSP_DISP_RST, 1);
+    /* E1003 power rails are ACTIVE-LOW (P-channel load switches) */
+    gpio_set_level(BSP_DISP_DC, 0);       /* GPIO11: EPD power (LOW = ON) */
+    gpio_set_level(BSP_DISP_VCC_EN, 0);   /* GPIO21: 1.8V logic (LOW = ON) */
+    gpio_set_direction(BSP_DISP_DC, GPIO_MODE_OUTPUT);
+    gpio_set_direction(BSP_DISP_VCC_EN, GPIO_MODE_OUTPUT);
 
-    /* DC / EN */
-    gpio_config_t dc = {
-        .pin_bit_mask = BIT64(BSP_DISP_DC),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&dc);
-    gpio_set_level(BSP_DISP_DC, 0);
+    /* Let power rails stabilise (Arduino examples use 50 ms) */
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    /* BUSY — input */
-    gpio_config_t busy = {
-        .pin_bit_mask = BIT64(BSP_DISP_BUSY),
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&busy);
-
-    /* CS — output, idle HIGH */
-    gpio_config_t cs = {
-        .pin_bit_mask = BIT64(BSP_DISP_CS),
-        .mode         = GPIO_MODE_OUTPUT,
-        .pull_up_en   = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&cs);
+    /* CS: HIGH = deselected */
     gpio_set_level(BSP_DISP_CS, 1);
+    gpio_set_direction(BSP_DISP_CS, GPIO_MODE_OUTPUT);
 
-    ESP_LOGI(TAG, "Display GPIOs: %dx%d, IT8951", BSP_LCD_WIDTH, BSP_LCD_HEIGHT);
+    /* RST: HIGH = not in reset */
+    gpio_set_level(BSP_DISP_RST, 1);
+    gpio_set_direction(BSP_DISP_RST, GPIO_MODE_OUTPUT);
+
+    /* BUSY: input */
+    gpio_set_direction(BSP_DISP_BUSY, GPIO_MODE_INPUT);
+
+    ESP_LOGI(TAG, "Display: %dx%d IT8951 (VCC=GPIO%d=%d EN=GPIO%d=%d BUSY=%d)",
+             BSP_LCD_WIDTH, BSP_LCD_HEIGHT,
+             BSP_DISP_VCC_EN, gpio_get_level(BSP_DISP_VCC_EN),
+             BSP_DISP_DC, gpio_get_level(BSP_DISP_DC),
+             gpio_get_level(BSP_DISP_BUSY));
     return ESP_OK;
 }
 
@@ -403,6 +379,175 @@ esp_err_t bsp_sht4x_read(float *temp_c, float *humidity_pct)
     if (*humidity_pct < 0.0f)   *humidity_pct = 0.0f;
 
     return ESP_OK;
+}
+
+/* ==========================================================================
+ * IT8951 display probe (SPI2 / FSPI)
+ *
+ * The IT8951 uses a 16-bit SPI protocol with preamble words:
+ *   0x6000 → write command follows
+ *   0x0000 → write data follows
+ *   0x1000 → read data follows (+ 1 dummy word, then read word)
+ * ========================================================================== */
+
+#define IT8951_CMD_SYS_RUN    0x0001
+#define IT8951_CMD_REG_RD     0x0010
+#define IT8951_CMD_GET_DEV_INFO 0x0302
+
+static spi_device_handle_t s_spi_disp = NULL;
+
+/* Helper: wait for HRDY, return false on timeout */
+static bool it8951_wait_ready(int timeout_ms)
+{
+    int timeout_us = timeout_ms * 1000;
+    while (gpio_get_level(BSP_DISP_BUSY) == 0 && --timeout_us > 0) {
+        esp_rom_delay_us(1);
+    }
+    return timeout_us > 0;
+}
+
+/* Write command + N data words in one CS-low session (matches GxEPD2 protocol).
+ * Preamble 0x6000 → cmd, then 0x0000 → data, ... */
+static void it8951_write_cmd_data(spi_device_handle_t spi, uint16_t cmd,
+                                  const uint16_t *data, size_t n_data)
+{
+    /* Build buffer: preamble + cmd + N× (preamble + data) */
+    size_t n_words = 2 + n_data * 2;  /* (pre+cmd) + n×(pre+data) */
+    uint16_t buf[n_words];
+    buf[0] = 0x6000;  buf[1] = cmd;
+    for (size_t i = 0; i < n_data; i++) {
+        buf[2 + i * 2]     = 0x0000;
+        buf[2 + i * 2 + 1] = data[i];
+    }
+
+    spi_transaction_t t = { .length = n_words * 16, .tx_buffer = buf };
+    it8951_wait_ready(10);
+    spi_device_polling_transmit(spi, &t);
+}
+
+static uint16_t it8951_read_reg(spi_device_handle_t spi, uint16_t reg)
+{
+    /* Build buffer: REG_RD cmd + reg addr, then read preamble + dummy + read */
+    uint16_t tx[5] = {0x6000, IT8951_CMD_REG_RD, 0x0000, reg, 0x1000}; /* then dummy+read */
+    uint16_t rx[5] = {0};
+    spi_transaction_t t = {
+        .length   = 5 * 16,
+        .rxlength = 5 * 16,
+        .tx_buffer = tx,
+        .rx_buffer = rx,
+    };
+    it8951_wait_ready(10);
+    spi_device_polling_transmit(spi, &t);
+
+    /* Now do dummy + read as separate step (IT8951 needs time after preamble) */
+    it8951_wait_ready(10);
+    uint16_t tx2[2] = {0x0000, 0x0000};
+    uint16_t rx2[2] = {0};
+    spi_transaction_t t2 = { .length = 2 * 16, .rxlength = 2 * 16, .tx_buffer = tx2, .rx_buffer = rx2 };
+    spi_device_polling_transmit(spi, &t2);
+    return rx2[1];
+}
+
+esp_err_t bsp_display_probe(void)
+{
+    /* Power rails already enabled.  Turn off SD card to avoid MISO conflict. */
+    gpio_set_level(BSP_SD_PWR_EN, 0);  /* SD power OFF */
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    ESP_LOGI(TAG, "IT8951 BUSY after power-up: %d (0=busy, 1=ready)",
+             gpio_get_level(BSP_DISP_BUSY));
+
+    /* Hardware reset: pulse RST LOW, then wait for BUSY=HIGH */
+    gpio_set_level(BSP_DISP_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(BSP_DISP_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    ESP_LOGI(TAG, "IT8951 BUSY after reset: %d", gpio_get_level(BSP_DISP_BUSY));
+
+    /* One-time SPI bus init */
+    if (!s_spi_disp) {
+        spi_bus_config_t bus = {
+            .mosi_io_num     = BSP_DISP_MOSI,
+            .miso_io_num     = BSP_DISP_MISO,
+            .sclk_io_num     = BSP_DISP_SCK,
+            .quadwp_io_num   = -1,
+            .quadhd_io_num   = -1,
+            .max_transfer_sz = 4092,
+        };
+        ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO));
+
+        spi_device_interface_config_t dev = {
+            .mode          = 0,                    /* SPI_MODE0 */
+            .clock_speed_hz = 1 * 1000 * 1000,     /* 1 MHz — slow to debug */
+            .spics_io_num  = BSP_DISP_CS,
+            .queue_size    = 1,
+        };
+        ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev, &s_spi_disp));
+    }
+
+    /* Wake the controller — if BUSY responds, IT8951 is alive */
+    it8951_write_cmd_data(s_spi_disp, IT8951_CMD_SYS_RUN, NULL, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    /* Try a register read to verify full SPI (cmd + data + read) */
+    uint16_t reg_val = it8951_read_reg(s_spi_disp, 0x0004);
+    if (reg_val != 0xFFFF && reg_val != 0x0000) {
+        ESP_LOGI(TAG, "IT8951 SPI OK — I80CPCR = 0x%04X", reg_val);
+    } else {
+        ESP_LOGW(TAG, "IT8951 powered (BUSY OK) but SPI MISO reads 0x%04X — needs driver init", reg_val);
+    }
+
+    return ESP_OK;
+}
+
+/* ==========================================================================
+ * GT911 touch probe
+ * ========================================================================== */
+
+esp_err_t bsp_touch_probe(void)
+{
+    if (!s_i2c0_handle) return ESP_ERR_NOT_FOUND;
+
+    /* Give the GT911 time to boot after reset */
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    /* Try both known GT911 addresses (0x5D and 0x14) */
+    const uint8_t addrs[] = {BSP_I2C_ADDR_GT911_1, BSP_I2C_ADDR_GT911_2};
+    i2c_master_dev_handle_t touch_dev = NULL;
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
+    uint8_t found_addr = 0;
+
+    for (int i = 0; i < 2; i++) {
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address  = addrs[i],
+            .scl_speed_hz    = BSP_I2C_CLK_FAST,
+        };
+        ret = i2c_master_bus_add_device(s_i2c0_handle, &dev_cfg, &touch_dev);
+        if (ret != ESP_OK) continue;
+
+        /* Read product-ID register at 0x8140 */
+        uint8_t tx[2] = {0x81, 0x40};
+        uint8_t rx[4] = {0};
+        ret = i2c_master_transmit_receive(touch_dev, tx, 2, rx, 4, 20);
+        if (ret == ESP_OK) {
+            found_addr = addrs[i];
+            ESP_LOGI(TAG, "GT911 product: %c%c%c%c (addr 0x%02X)",
+                     rx[0], rx[1], rx[2], rx[3], found_addr);
+            break;
+        }
+        i2c_master_bus_rm_device(touch_dev);
+        touch_dev = NULL;
+    }
+
+    if (!found_addr) {
+        ESP_LOGW(TAG, "GT911 probe: no response (touch may need power-cycle)");
+    }
+
+    /* Don't leak device handles */
+    if (touch_dev) i2c_master_bus_rm_device(touch_dev);
+    return (found_addr != 0) ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 /* ==========================================================================

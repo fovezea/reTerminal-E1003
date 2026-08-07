@@ -16,8 +16,8 @@
 static const char *TAG = "app";
 
 /* --- Hardcoded WiFi credentials ------------------------------------------- */
-#define WIFI_SSID     "apacalda"
-#define WIFI_PASSWORD "apacaldahaideshimdighel"
+#define WIFI_SSID     "your-ssid"
+#define WIFI_PASSWORD "your-password"
 
 static EventGroupHandle_t s_wifi_evt;
 #define WIFI_CONNECTED_BIT BIT0
@@ -115,6 +115,10 @@ void app_main(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "BSP init returned error: 0x%x", err);
     }
+
+    /* --- Probe display & touch --- */
+    bsp_display_probe();
+    bsp_touch_probe();
 
     /* Read battery */
     uint32_t bat_mv = 0;
