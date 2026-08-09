@@ -5,6 +5,7 @@ idf_component_register(
         "."
     REQUIRES
         bsp
+        driver
         esp_psram
         spi_flash
 )

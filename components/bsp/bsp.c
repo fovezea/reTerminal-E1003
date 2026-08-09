@@ -21,6 +21,11 @@ static const char *TAG = "bsp";
 /* I2C0 bus handle — created once, used by the scanner and peripherals */
 static i2c_master_bus_handle_t s_i2c0_handle = NULL;
 
+i2c_master_bus_handle_t bsp_i2c0_get_handle(void)
+{
+    return s_i2c0_handle;
+}
+
 /* I2C device handles for onboard sensors */
 static i2c_master_dev_handle_t s_rtc_dev    = NULL;
 static i2c_master_dev_handle_t s_sht4x_dev  = NULL;
@@ -75,11 +80,10 @@ static void bsp_i2c_scan(void)
 
 esp_err_t bsp_display_init(void)
 {
-    /* Minimal Arduino-style init — set level BEFORE direction to avoid glitches */
-
-    /* E1003 power rails are ACTIVE-LOW (P-channel load switches) */
-    gpio_set_level(BSP_DISP_DC, 0);       /* GPIO11: EPD power (LOW = ON) */
-    gpio_set_level(BSP_DISP_VCC_EN, 0);   /* GPIO21: 1.8V logic (LOW = ON) */
+    /* Minimal Arduino-style init — set level BEFORE direction to avoid glitches.
+     * GxEPD2 Arduino sketch sets both ENABLE pins HIGH. */
+    gpio_set_level(BSP_DISP_DC, 1);       /* GPIO11: EPD_TFT_ENABLE (HIGH = ON) */
+    gpio_set_level(BSP_DISP_VCC_EN, 1);   /* GPIO21: EPD_ITE_ENABLE (HIGH = ON) */
     gpio_set_direction(BSP_DISP_DC, GPIO_MODE_OUTPUT);
     gpio_set_direction(BSP_DISP_VCC_EN, GPIO_MODE_OUTPUT);
 
@@ -307,9 +311,9 @@ void bsp_power_down(void)
 {
     ESP_LOGI(TAG, "Powering down peripherals ...");
 
-    /* Display power OFF (active-low: HIGH = off) */
-    gpio_set_level(BSP_DISP_DC, 1);
-    gpio_set_level(BSP_DISP_VCC_EN, 1);
+    /* Display power OFF (active-HIGH: LOW = off) */
+    gpio_set_level(BSP_DISP_DC, 0);
+    gpio_set_level(BSP_DISP_VCC_EN, 0);
 
     /* SD card power OFF */
     gpio_set_level(BSP_SD_PWR_EN, 0);

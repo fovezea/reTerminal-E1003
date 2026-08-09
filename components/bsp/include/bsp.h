@@ -17,6 +17,7 @@
 
 #include "driver/gpio.h"
 #include "hal/gpio_types.h"
+#include "driver/i2c_master.h"
 #include "hal/adc_types.h"
 #include "esp_err.h"
 
@@ -273,6 +274,17 @@ esp_err_t bsp_rtc_read_time(bsp_rtc_time_t *time);
  * @return ESP_OK, ESP_ERR_NOT_FOUND if sensor is unreachable, or an I2C error.
  */
 esp_err_t bsp_sht4x_read(float *temp_c, float *humidity_pct);
+
+/* ==========================================================================
+ * LVGL display / touch integration
+ * ========================================================================== */
+
+esp_err_t bsp_lvgl_display_init(void);
+esp_err_t bsp_lvgl_touch_init(void);
+esp_err_t bsp_lvgl_tick_init(void);
+
+/** @brief Get the I2C0 bus handle (needed by touch driver in lvgl_port.c) */
+i2c_master_bus_handle_t bsp_i2c0_get_handle(void);
 
 #ifdef __cplusplus
 }

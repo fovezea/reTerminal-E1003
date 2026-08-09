@@ -8,111 +8,54 @@
 #include "esp_flash.h"
 #include "esp_psram.h"
 #include "bsp.h"
+#include "it8951.h"
 
 static const char *TAG = "app";
 
-/* ==========================================================================
- * App
- * ========================================================================== */
-
 void app_main(void)
 {
-    esp_chip_info_t chip_info;
-    esp_chip_info(&chip_info);
+    ESP_LOGI(TAG, "reTerminal E1003 — direct IT8951 test  [wake: %s]",
+             bsp_wake_cause_str());
+    ESP_LOGI(TAG, "PSRAM: %u MB", (unsigned)(esp_psram_get_size() >> 20));
 
-    ESP_LOGI(TAG, "reTerminal E1003 — ESP-IDF v6  [wake: %s]", bsp_wake_cause_str());
-    ESP_LOGI(TAG, "Target: %s | cores: %d | rev: %d",
-             CONFIG_IDF_TARGET,
-             chip_info.cores,
-             chip_info.revision);
+    bsp_init();
+    uint32_t bat_mv;
+    bsp_battery_read_mv(&bat_mv);
+    ESP_LOGI(TAG, "Battery: %lu mV", (unsigned long)bat_mv);
 
-    uint32_t flash_size;
-    if (esp_flash_get_size(NULL, &flash_size) == ESP_OK) {
-        ESP_LOGI(TAG, "Flash: %lu MB (%s)",
-                 (unsigned long)(flash_size >> 20),
-                 (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
-    }
-
-    size_t psram_size = esp_psram_get_size();
-    ESP_LOGI(TAG, "PSRAM: %s (%u MB)",
-             psram_size > 0 ? "present" : "not detected",
-             (unsigned)(psram_size >> 20));
-
-    /* Initialise the board */
-    esp_err_t err = bsp_init();
+    /* Init display */
+    esp_err_t err = it8951_init();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "BSP init returned error: 0x%x", err);
+        ESP_LOGE(TAG, "IT8951 init failed");
+        bsp_deep_sleep_enter(30, true);
     }
 
-    /* --- Probe display & touch --- */
-    bsp_display_probe();
-    bsp_touch_probe();
+    ESP_LOGI(TAG, "Clear screen (INIT mode — will take ~30s)...");
+    it8951_clear_screen();
+    ESP_LOGI(TAG, "Screen cleared!");
 
-    /* Read battery */
-    uint32_t bat_mv = 0;
-    if (bsp_battery_read_mv(&bat_mv) == ESP_OK) {
-        ESP_LOGI(TAG, "Battery: %lu mV (%.2f V)",
-                 (unsigned long)bat_mv, bat_mv / 1000.0f);
+    /* Draw a simple pattern: black rectangle in the center */
+    uint16_t w = 400, h = 200;
+    uint16_t x = (BSP_LCD_WIDTH - w) / 2;
+    uint16_t y = (BSP_LCD_HEIGHT - h) / 2;
+    uint16_t row_bytes = (w + 7) / 8;
+
+    ESP_LOGI(TAG, "Drawing %dx%d rect at (%d,%d)...", w, h, x, y);
+
+    it8951_load_start(x, y, w, h);
+
+    /* Send all-black rows (1bpp: 0x00 bytes = black) */
+    uint8_t black_row[row_bytes];
+    memset(black_row, 0x00, row_bytes);
+    for (uint16_t row = 0; row < h; row++) {
+        it8951_load_flush(black_row, row_bytes);
     }
 
-    /* Blink the LED a few times */
-    for (int i = 0; i < 3; i++) {
-        BSP_LED_ON();
-        vTaskDelay(pdMS_TO_TICKS(200));
-        BSP_LED_OFF();
-        vTaskDelay(pdMS_TO_TICKS(200));
-    }
+    it8951_load_end();
+    it8951_display_area(x, y, w, h);
 
-    /* --- RTC: set time if voltage was low (battery drained) --- */
-    bsp_rtc_time_t rtc;
-    if (bsp_rtc_read_time(&rtc) == ESP_OK && !rtc.voltage_ok) {
-        ESP_LOGW(TAG, "RTC battery was drained — setting time from compile timestamp");
+    ESP_LOGI(TAG, "Rectangle drawn! Sleeping in 10s...");
+    vTaskDelay(pdMS_TO_TICKS(10000));
 
-        /* Parse __DATE__ "Aug  8 2026" and __TIME__ "01:23:45" */
-        const char *months = "JanFebMarAprMayJunJulAugSepOctNovDec";
-        bsp_rtc_time_t now = {0};
-        for (int i = 0; i < 12; i++) {
-            if (strncmp(__DATE__, months + i * 3, 3) == 0) { now.month = i + 1; break; }
-        }
-        now.year   = atoi(__DATE__ + 7);
-        now.day    = atoi(__DATE__ + 4);
-        now.hour   = atoi(__TIME__);
-        now.minute = atoi(__TIME__ + 3);
-        now.second = atoi(__TIME__ + 6);
-
-        bsp_rtc_set_time(&now);
-        ESP_LOGI(TAG, "RTC set to: %04d-%02d-%02d %02d:%02d:%02d",
-                 now.year, now.month, now.day, now.hour, now.minute, now.second);
-    }
-
-    /* --- Low-power demo: wake → log sensors → deep sleep → repeat --- */
-
-    #define SLEEP_SEC 30
-
-    /* Read RTC once */
-    if (bsp_rtc_read_time(&rtc) == ESP_OK) {
-        ESP_LOGI(TAG, "RTC: %04d-%02d-%02d %02d:%02d:%02d%s",
-                 rtc.year, rtc.month, rtc.day,
-                 rtc.hour, rtc.minute, rtc.second,
-                 rtc.voltage_ok ? "" : " [VL]");
-    }
-
-    /* Read SHT4x once */
-    float temp_c, humidity;
-    if (bsp_sht4x_read(&temp_c, &humidity) == ESP_OK) {
-        ESP_LOGI(TAG, "SHT4x: %.1f C  %.1f %%RH", temp_c, humidity);
-    }
-
-    /* Read battery once */
-    if (bsp_battery_read_mv(&bat_mv) == ESP_OK) {
-        ESP_LOGI(TAG, "Battery: %lu mV (%.2f V)",
-                 (unsigned long)bat_mv, bat_mv / 1000.0f);
-    }
-
-    /* Brief LED blink to confirm we're alive */
-    BSP_LED_ON();  vTaskDelay(pdMS_TO_TICKS(100));
-    BSP_LED_OFF();
-
-    /* Enter deep sleep — wake on timer or KEY0 press */
-    bsp_deep_sleep_enter(SLEEP_SEC, true);
+    bsp_deep_sleep_enter(30, true);
 }

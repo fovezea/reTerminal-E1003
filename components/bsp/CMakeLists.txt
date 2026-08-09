@@ -1,6 +1,8 @@
 idf_component_register(
     SRCS
         "bsp.c"
+        "it8951.c"
+        "lvgl_port.cpp"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -10,6 +12,9 @@ idf_component_register(
         esp_driver_i2c
         esp_driver_spi
         esp_hw_support
+        esp_system
+        esp_timer
         freertos
         hal
+        lvgl
 )
