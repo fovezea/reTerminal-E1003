@@ -273,7 +273,7 @@ void it8951_clear_screen(void) {
     write_cmd(CMD_DPY_AREA);
     write_data(0); write_data(0);
     write_data(PANEL_W); write_data(PANEL_H);
-    write_data(0);  /* INIT mode for full refresh */
+    write_data(2);  /* GC16 — standard update, no flash */
     wait_hrdy();
 
     wait_lut();
