@@ -273,7 +273,7 @@ void it8951_clear_screen(void) {
     write_cmd(CMD_DPY_AREA);
     write_data(0); write_data(0);
     write_data(PANEL_W); write_data(PANEL_H);
-    write_data(2);  /* GC16 — standard update, no flash */
+    write_data(1);  /* DU — direct update, zero flash */
     wait_hrdy();
 
     wait_lut();
@@ -292,6 +292,56 @@ void it8951_clear_screen(void) {
     }
 
     ESP_LOGI(TAG, "Screen cleared in %lld ms", (long long)(esp_timer_get_time() / 1000 - t0));
+}
+
+/* Deep-clean with INIT mode — flashes but removes all ghosting.
+ * Use once at boot; subsequent updates use clear_screen (DU mode). */
+void it8951_clean_screen(void) {
+    int64_t t0 = esp_timer_get_time() / 1000;
+
+    write_cmd(0x0040); write_data(0x0001); write_data(16);
+
+    set_img_buf_addr();
+
+    static uint8_t white_row[WB];
+    static bool row_init = false;
+    if (!row_init) { memset(white_row, 0xFF, WB); row_init = true; }
+
+    /* 1bpp image load — white */
+    {
+        uint16_t args[5];
+        args[0] = (0 << 8) | (3 << 4) | 0;        /* L_ENDIAN, 8BPP, ROTATE_0 */
+        args[1] = 0; args[2] = 0;
+        args[3] = WB; args[4] = PANEL_H;
+        write_cmd(CMD_LD_IMG_AREA);
+        for (int i = 0; i < 5; i++) write_data(args[i]);
+    }
+    cs_low(); wait_hrdy(); xfer16(PRE_WRITE_DATA); wait_hrdy();
+    for (uint16_t row = 0; row < PANEL_H; row++) {
+        xfer8n(white_row, WB);
+        if ((row & 0x3F) == 0) vTaskDelay(1);
+    }
+    cs_high();
+    write_cmd(CMD_LD_IMG_END); wait_hrdy();
+
+    /* DPY_AREA with INIT mode (0) — full deep clean */
+    {
+        uint16_t up1sr_hi = read_reg(REG_UP1SR + 2);
+        write_reg(REG_UP1SR + 2, up1sr_hi | (1u << 2));
+        write_reg(REG_BGVR, ((uint16_t)0x00 << 8) | 0xFF);
+    }
+    write_cmd(CMD_DPY_AREA);
+    write_data(0); write_data(0);
+    write_data(PANEL_W); write_data(PANEL_H);
+    write_data(0);  /* INIT */
+    wait_hrdy();
+    wait_lut();
+    {
+        uint16_t up1sr_hi = read_reg(REG_UP1SR + 2);
+        write_reg(REG_UP1SR + 2, up1sr_hi & ~(1u << 2));
+    }
+
+    ESP_LOGI(TAG, "Deep-clean done in %lld ms", (long long)(esp_timer_get_time() / 1000 - t0));
 }
 
 /* ==========================================================================
@@ -346,7 +396,7 @@ void it8951_display_area(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     write_data(y);
     write_data(w);
     write_data(h);
-    write_data(2);  /* GC16 — standard 16-gray update */
+    write_data(1);  /* DU — direct update, zero flash */
     wait_hrdy();
 
     wait_lut();
@@ -354,6 +404,66 @@ void it8951_display_area(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     /* Restore normal mode */
     up1sr_hi = read_reg(REG_UP1SR + 2);
     write_reg(REG_UP1SR + 2, up1sr_hi & ~(1u << 2));
+}
+
+/* ==========================================================================
+ * 8BPP full-frame — GxEPD2 _doFullRefresh clone (proven working path)
+ * ========================================================================== */
+void it8951_write_8bpp_frame(const uint8_t *fb8)
+{
+    int64_t t0 = esp_timer_get_time() / 1000;
+
+    write_cmd(0x0040); write_data(0x0001); write_data(16);
+
+    /* LD_IMG_AREA: B_ENDIAN, 8BPP, full pixel width */
+    {
+        uint16_t args[5];
+        args[0] = (1 << 8) | (3 << 4) | 0;  /* B_ENDIAN, 8BPP, ROTATE_0 */
+        args[1] = 0;
+        args[2] = 0;
+        args[3] = PANEL_W;    /* width in PIXELS */
+        args[4] = PANEL_H;
+        write_cmd(CMD_LD_IMG_AREA);
+        for (int i = 0; i < 5; i++) write_data(args[i]);
+    }
+
+    /* One 0x0000 preamble, then stream 8BPP bytes in bulk.
+     * X-mirror: send each row right-to-left. */
+    cs_low(); wait_hrdy(); xfer16(PRE_WRITE_DATA); wait_hrdy();
+
+    /* Row buffer for X-mirrored row (internal SRAM, DMA-safe) */
+    uint8_t *mirror_row = malloc(PANEL_W);
+    assert(mirror_row);
+
+    for (uint16_t row = 0; row < PANEL_H; row++) {
+        const uint8_t *rp = fb8 + (uint32_t)row * PANEL_W;
+        /* X-mirror: reverse bytes within row */
+        for (int32_t col = 0; col < PANEL_W; col++) {
+            mirror_row[col] = rp[PANEL_W - 1 - col];
+        }
+        xfer8n(mirror_row, PANEL_W);
+        if ((row & 0x3F) == 0) vTaskDelay(1);
+    }
+    free(mirror_row);
+    cs_high();
+
+    write_cmd(CMD_LD_IMG_END); wait_hrdy();
+
+    /* DPY_AREA — GC16, no UP1SR needed for 8BPP */
+    write_cmd(CMD_DPY_AREA);
+    write_data(0); write_data(0);
+    write_data(PANEL_W); write_data(PANEL_H);
+    write_data(2);  /* GC16 */
+    wait_hrdy();
+
+    /* Wait for refresh to complete */
+    int64_t t1 = esp_timer_get_time() / 1000;
+    while (gpio_get_level(BSP_DISP_BUSY) == 0) {
+        if ((esp_timer_get_time() / 1000) - t1 > 15000) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGI(TAG, "8BPP frame: %lld ms", (long long)(esp_timer_get_time() / 1000 - t0));
 }
 
 uint16_t it8951_get_width(void)  { return s_panel_w; }

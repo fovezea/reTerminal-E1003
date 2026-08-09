@@ -16,8 +16,25 @@ extern "C" {
 /** Full initialisation: SPI, reset, VCOM, temperature, system info. */
 esp_err_t it8951_init(void);
 
-/** Clear the screen to white (INIT mode refresh). */
+/** Clear the screen to white (DU mode — no flash, minimal ghosting). */
 void it8951_clear_screen(void);
+
+/** Deep-clean the screen with INIT mode — flashes but removes all ghosting.
+ *  Use once at boot; subsequent updates should use clear_screen(). */
+void it8951_clean_screen(void);
+
+/**
+ * @brief Write a full 8BPP (1 byte/pixel) framebuffer and refresh.
+ *
+ * Matches GxEPD2 _doFullRefresh exactly:
+ *   - LD_IMG_AREA: B_ENDIAN, 8BPP, full pixel width
+ *   - Data: bytes right-to-left, bits LSB-first within byte
+ *   - DPY_AREA: GC16 mode, no UP1SR
+ *
+ * @param fb8  Full-screen buffer: WIDTH × HEIGHT bytes.
+ *             0x00 = black, 0xFF = white.
+ */
+void it8951_write_8bpp_frame(const uint8_t *fb8);
 
 /**
  * @brief Write 1bpp image data to the IT8951 image buffer.

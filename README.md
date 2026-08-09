@@ -30,8 +30,8 @@ Seeed Studio white-paper HMI firmware — ESP-IDF v6.
 | CS | 10 | |
 | RST | 12 | |
 | BUSY (HRDY) | 13 | |
-| DC/EN (EPD power) | 11 | active-LOW |
-| VCC_EN (1.8V logic) | 21 | active-LOW |
+| EPD_TFT_ENABLE | 11 | active-HIGH (panel power) |
+| EPD_ITE_ENABLE  | 21 | active-HIGH (IT8951 logic) |
 
 #### I2C0 bus (SDA=GPIO19, SCL=GPIO20, 400 kHz)
 | Device | Address |
@@ -70,13 +70,15 @@ Seeed Studio white-paper HMI firmware — ESP-IDF v6.
 | Switch | 40 (HIGH = battery connected) |
 | Divider ratio | 2:1 |
 
-### Power enables (ACTIVE-LOW on this board revision)
+### Power enables
 
-Both display power enables are **active-LOW** — set LOW to turn ON, HIGH to turn OFF:
-- GPIO11 (EPD panel power)
-- GPIO21 (IT8951 1.8V logic)
+Both display enables are **active-HIGH** — confirmed by the working GxEPD2 Arduino sketch
+and the Seeed LVGLePaperStatusPanel example:
+- GPIO11 (`EPD_TFT_ENABLE`) — set HIGH to turn ON panel power
+- GPIO21 (`EPD_ITE_ENABLE`) — set HIGH to turn ON IT8951 logic
 
-This was discovered empirically; manufacturer Arduino examples show HIGH, but this board revision uses P-channel load switches that require LOW.
+The original BSP incorrectly assumed P-channel load switches (active-LOW), which left
+the panel power supply OFF and caused HRDY/BUSY to stay stuck LOW.
 
 ## Project structure
 
@@ -161,14 +163,52 @@ with Arduino and WiFi disabled. Key differences from vanilla ESP-IDF defaults:
 - Flash: 16 MB QIO @ 80 MHz
 - Sleep GPIO reset workaround disabled
 
-## Known hardware findings
+## Display driver architecture
 
-### IT8951 SPI MISO
+The IT8951 driver (`components/bsp/it8951.c`) was ported from the GxEPD2
+`ED103TC2_1872x1404` reference in `OSHW-reTerminal/examples/`.
 
-The display controller is powered and responds to commands (BUSY pin toggles correctly),
-but SPI MISO reads always return 0xFFFF. A full IT8951 driver library is needed for
-proper register initialization before MISO works. The Arduino examples use the
-`Seeed_GFX` or `bb_epaper`/`FastEPD` libraries which handle this.
+### Data paths
+
+There are two IT8951 data paths:
+
+| Path | BPP | Width param | Data per row | UP1SR | Used by |
+|------|-----|-------------|--------------|-------|---------|
+| **8BPP** (proven) | 1 byte/px | 1872 px | 1872 B | No | `clear_screen`, LVGL `panel_update` |
+| **1bpp** (partial) | 1 bit/px | 234 B (packed) | 234 B | Yes | `load_start/flush/end` + `display_area` |
+
+The **8BPP path** is the reliable one for full-screen updates — it expands each
+pixel to a byte (0x00 black, 0xFF white) and uses GC16/DU mode without UP1SR.
+The 1bpp path works for partial regions (rectangles) but has an unresolved
+byte-level alignment issue with full-screen mixed-content data.
+
+### LVGL integration
+
+`lvgl_port.cpp` follows the Seeed `LVGLePaperStatusPanel` example:
+
+1. LVGL renders RGB565 into a small PARTIAL buffer (20 lines × 1872 px)
+2. The flush callback converts RGB565 → 8BPP and writes to a full-screen
+   framebuffer (2.6 MB in PSRAM): `s_fb[y * W + x] = dark ? 0x00 : 0xFF`
+3. After `lv_timer_handler()`, `bsp_lvgl_panel_update()` calls
+   `it8951_write_8bpp_frame()` which sends the 8BPP buffer via the proven
+   bulk-transfer path with X-mirror byte reversal
+4. One DPY_AREA refresh (DU mode, zero flash) updates the panel
+
+### Key fixes discovered
+
+- **GPIO11/GPIO21 polarity**: The enables are active-**HIGH**, matching the
+  GxEPD2 Arduino sketch. Setting them LOW (as originally done) leaves the
+  panel power OFF, causing HRDY/BUSY to stay stuck LOW.
+- **`wait_hrdy()` yields**: Uses `vTaskDelay(1)` instead of `esp_rom_delay_us()`
+  to feed the FreeRTOS task watchdog during long SPI operations.
+- **Bulk SPI transfers**: `xfer8n()` sends up to 4092 bytes per transaction,
+  avoiding the overhead of per-byte `spi_device_polling_transmit()` calls.
+- **SD card power OFF during IT8951 init**: Both share SPI2 MISO (GPIO8);
+  the SD card must be deselected to avoid bus conflict.
+- **Temperature command**: `write_cmd(0x0040)` must be sent before every
+  DPY_AREA; without it the IT8951 accepts the command but skips the refresh.
+
+### Known hardware findings
 
 ### 0x6B I2C device
 
@@ -194,4 +234,5 @@ the PSRAM is external (Octal SPI), not embedded. Use `esp_psram_get_size()` inst
 | Deep sleep (timer) | ✅ 30s cycle |
 | Deep sleep (button) | ✅ GPIO3 wake |
 | WiFi | ✅ Tested (removed from current build for power) |
-| IT8951 display | ⚠️ Alive, needs full driver init for SPI reads |
+| IT8951 display | ✅ Working — 8BPP path with LVGL rendering |
+| LVGL on e-Paper | ✅ Working — RGB565→8BPP, DU mode (zero flash) |
