@@ -112,10 +112,10 @@ extern "C" {
  * Battery monitoring (shared ADC pin with KEY0, muxed via load switch)
  * ========================================================================== */
 
-#define BSP_BAT_ADC            GPIO_NUM_3     /* ADC1_CH3 — shared with KEY0 */
-#define BSP_BAT_ADC_CHANNEL    ADC_CHANNEL_3
+#define BSP_BAT_ADC            GPIO_NUM_1     /* ADC1_CH0 — battery voltage */
+#define BSP_BAT_ADC_CHANNEL    ADC_CHANNEL_0
 #define BSP_BAT_ADC_UNIT       ADC_UNIT_1
-#define BSP_BAT_SWITCH         GPIO_NUM_40    /* load-switch enable, HIGH = battery → ADC */
+#define BSP_BAT_SWITCH         GPIO_NUM_40    /* HIGH = enable battery monitoring */
 
 /* Voltage-divider ratio: the board uses two equal resistors, so we double. */
 #define BSP_BAT_DIVIDER        2.0f

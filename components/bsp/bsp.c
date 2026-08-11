@@ -15,6 +15,8 @@
 #include "soc/gpio_struct.h"
 #include "hal/adc_types.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
 static const char *TAG = "bsp";
 
@@ -30,6 +32,8 @@ i2c_master_bus_handle_t bsp_i2c0_get_handle(void)
 static i2c_master_dev_handle_t s_rtc_dev    = NULL;
 static i2c_master_dev_handle_t s_sht4x_dev  = NULL;
 static spi_device_handle_t     s_spi_disp   = NULL;
+static adc_cali_handle_t       s_adc_cali   = NULL;
+static adc_oneshot_unit_handle_t s_adc_handle = NULL;
 
 /* ==========================================================================
  * I2C0 helpers (new driver API — ESP-IDF v6)
@@ -235,7 +239,7 @@ esp_err_t bsp_buzzer_init(void)
 
 esp_err_t bsp_battery_init(void)
 {
-    /* Load switch — OFF by default */
+    /* Battery enable switch — OFF by default */
     gpio_config_t sw = {
         .pin_bit_mask = BIT64(BSP_BAT_SWITCH),
         .mode         = GPIO_MODE_OUTPUT,
@@ -246,20 +250,12 @@ esp_err_t bsp_battery_init(void)
     gpio_config(&sw);
     gpio_set_level(BSP_BAT_SWITCH, 0);
 
-    ESP_LOGI(TAG, "Battery monitor: ADC_CH%d, switch GPIO%d",
-             BSP_BAT_ADC_CHANNEL, BSP_BAT_SWITCH);
-    return ESP_OK;
-}
-
-esp_err_t bsp_battery_read_mv(uint32_t *voltage_mv)
-{
-    if (voltage_mv == NULL) return ESP_ERR_INVALID_ARG;
-
-    adc_oneshot_unit_handle_t adc_handle = NULL;
+    /* One-time ADC unit init */
     adc_oneshot_unit_init_cfg_t adc_cfg = {
         .unit_id = BSP_BAT_ADC_UNIT,
+        .clk_src = ADC_DIGI_CLK_SRC_DEFAULT,
     };
-    esp_err_t ret = adc_oneshot_new_unit(&adc_cfg, &adc_handle);
+    esp_err_t ret = adc_oneshot_new_unit(&adc_cfg, &s_adc_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "adc_oneshot_new_unit failed: %d", ret);
         return ret;
@@ -269,34 +265,59 @@ esp_err_t bsp_battery_read_mv(uint32_t *voltage_mv)
         .atten    = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_12,
     };
-    ret = adc_oneshot_config_channel(adc_handle, BSP_BAT_ADC_CHANNEL, &chan_cfg);
+    ret = adc_oneshot_config_channel(s_adc_handle, BSP_BAT_ADC_CHANNEL, &chan_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "adc_oneshot_config_channel failed: %d", ret);
-        adc_oneshot_del_unit(adc_handle);
         return ret;
     }
 
-    /* Enable the load switch */
+    /* One-time ADC calibration */
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+        .unit_id = BSP_BAT_ADC_UNIT,
+    };
+    adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_adc_cali);
+
+    ESP_LOGI(TAG, "Battery monitor: ADC_CH%d, switch GPIO%d",
+             BSP_BAT_ADC_CHANNEL, BSP_BAT_SWITCH);
+    return ESP_OK;
+}
+
+esp_err_t bsp_battery_read_mv(uint32_t *voltage_mv)
+{
+    if (voltage_mv == NULL) return ESP_ERR_INVALID_ARG;
+
+    /* Enable battery monitoring (GPIO40 HIGH) */
     gpio_set_level(BSP_BAT_SWITCH, 1);
     vTaskDelay(pdMS_TO_TICKS(5));
 
-    int raw = 0;
-    ret = adc_oneshot_read(adc_handle, BSP_BAT_ADC_CHANNEL, &raw);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "adc_oneshot_read failed: %d", ret);
-        gpio_set_level(BSP_BAT_SWITCH, 0);
-        adc_oneshot_del_unit(adc_handle);
-        return ret;
+    /* Dummy read to stabilise */
+    int dummy;
+    adc_oneshot_read(s_adc_handle, BSP_BAT_ADC_CHANNEL, &dummy);
+
+    /* Average 8 readings */
+    int32_t sum = 0;
+    for (int i = 0; i < 8; i++) {
+        int raw = 0;
+        adc_oneshot_read(s_adc_handle, BSP_BAT_ADC_CHANNEL, &raw);
+        sum += raw;
     }
 
-    /* Disable the load switch */
+    /* Disable battery monitoring */
     gpio_set_level(BSP_BAT_SWITCH, 0);
-    adc_oneshot_del_unit(adc_handle);
 
-    /* 12-bit ADC, 12 dB atten → ~2500 mV full-scale.
-     * Multiply by 2 for the external voltage divider. */
-    const int mv_at_adc = (raw * 2500) / 4096;
-    *voltage_mv = (uint32_t)((float)mv_at_adc * BSP_BAT_DIVIDER);
+    /* Convert raw → mV using pre-created calibration */
+    int avg = sum / 8;
+    int mv_at_pin = 0;
+    if (s_adc_cali) {
+        adc_cali_raw_to_voltage(s_adc_cali, avg, &mv_at_pin);
+    } else {
+        mv_at_pin = (avg * 3100) / 4096;
+    }
+
+    /* 2:1 voltage divider */
+    *voltage_mv = (uint32_t)mv_at_pin * 2;
 
     return ESP_OK;
 }
