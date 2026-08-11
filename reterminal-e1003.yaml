@@ -15,8 +15,8 @@ psram:
   mode: octal
 
 wifi:
-  ssid: "YOUR_SSID"                 # <-- change
-  password: "YOUR_PASSWORD"         # <-- change
+  ssid: "403"                 # <-- change
+  password: "12345678"
   ap:
     ssid: "reterminal-e1003"
     password: "fallback123"
@@ -35,18 +35,21 @@ ota:
     password: "YOUR_OTA_PASSWORD"   # <-- change
 
 # ============================================================
-# SPI Bus – dedicated for the IT8951 display
-# (uses different pins than the board preset to avoid conflict)
+# Deep Sleep – wake every 5 minutes, stay awake 30s
+# ============================================================
+deep_sleep:
+  run_duration: 30s
+  sleep_duration: 5min
+
+# ============================================================
+# SPI Bus & IT8951 Display
 # ============================================================
 spi:
   id: epaper_spi_bus
   clk_pin: GPIO7
   mosi_pin: GPIO9
-  miso_pin: GPIO8   # MISO is required (full‑duplex)
+  miso_pin: GPIO8
 
-# ============================================================
-# IT8951 display – linked to the dedicated SPI bus
-# ============================================================
 external_components:
   - source: github://pr#15346
     components: [it8951]
@@ -57,42 +60,36 @@ display:
     id: epaper_display
     spi_id: epaper_spi_bus
     model: seeed-reterminal-e1003
-    # cs_pin is not needed – the preset defines it
     update_interval: 5min
     lambda: |-
-      it.print(100, 100, id(my_font), Color::BLACK, "Hello reTerminal!");
-      it.print(100, 180, id(my_font), Color::BLACK, "ESPHome Ready");
+      // Read battery voltage
+      id(battery_enable).turn_on();
+      delay(100);
+      float raw = id(raw_battery_voltage).sample();
+      id(battery_enable).turn_off();
+      float voltage = raw * 2.0;
+
+      // Clear screen and display battery only
+      it.clear();
+      it.print(50, 200, id(my_font), Color::BLACK, "Battery:");
+      it.printf(250, 200, id(my_font), Color::BLACK, "%.2f V", voltage);
 
 font:
   - file: "gfonts://Roboto"
     id: my_font
     size: 48
 
+# ============================================================
+# I2C (SHT4x) – optional
+# ============================================================
 i2c:
   sda: GPIO19
   scl: GPIO20
   scan: true
 
-sensor:
-  - platform: adc
-    name: "Battery Voltage"
-    id: battery_voltage
-    pin: GPIO1
-    update_interval: 10s
-    attenuation: 11db
-    filters:
-      - multiply: 2.0
-    unit_of_measurement: V
-    accuracy_decimals: 2
-    icon: "mdi:battery"
-
-  - platform: sht4x
-    temperature:
-      name: "Temperature"
-    humidity:
-      name: "Humidity"
-    update_interval: 60s
-
+# ============================================================
+# Outputs
+# ============================================================
 output:
   - platform: gpio
     pin:
@@ -100,6 +97,48 @@ output:
       inverted: true
     id: onboard_led_output
 
+  - platform: gpio
+    pin: GPIO40
+    id: battery_enable
+    inverted: false
+
+# ============================================================
+# Sensors
+# ============================================================
+sensor:
+  # Temperature & Humidity (optional)
+  - platform: sht4x
+    temperature:
+      name: "Temperature"
+    humidity:
+      name: "Humidity"
+    update_interval: 5min
+
+  # Raw ADC for battery
+  - platform: adc
+    id: raw_battery_voltage
+    pin: GPIO1
+    attenuation: 11db
+    update_interval: never
+
+  # Template sensor for Home Assistant
+  - platform: template
+    name: "Battery Voltage"
+    id: battery_voltage
+    unit_of_measurement: V
+    accuracy_decimals: 2
+    icon: "mdi:battery"
+    update_interval: 5min
+    lambda: |-
+      id(battery_enable).turn_on();
+      delay(100);
+      float raw = id(raw_battery_voltage).sample();
+      id(battery_enable).turn_off();
+      return raw * 2.0;
+
+# ============================================================
+# Light & Buttons (optional)
+# ============================================================
 light:
   - platform: binary
     name: "Onboard LED"

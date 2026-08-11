@@ -24,6 +24,10 @@ void app_main(void)
     bsp_battery_read_mv(&bat_mv);
     ESP_LOGI(TAG, "Battery: %lu mV", (unsigned long)bat_mv);
 
+    float temp_c = 0, humidity = 0;
+    bsp_sht4x_read(&temp_c, &humidity);
+    ESP_LOGI(TAG, "SHT4x: %.1f C, %.0f %%", temp_c, humidity);
+
     ESP_ERROR_CHECK(bsp_lvgl_display_init());
     ESP_ERROR_CHECK(bsp_lvgl_touch_init());
     ESP_ERROR_CHECK(bsp_lvgl_tick_init());
@@ -38,12 +42,26 @@ void app_main(void)
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "reTerminal E1003");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_32, 0);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, -40);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
 
-    lv_obj_t *info = lv_label_create(scr);
-    lv_label_set_text_fmt(info, "Battery: %lu mV", (unsigned long)bat_mv);
-    lv_obj_set_style_text_font(info, &lv_font_montserrat_32, 0);
-    lv_obj_align(info, LV_ALIGN_CENTER, 0, 40);
+    char buf[64];
+    lv_obj_t *bat = lv_label_create(scr);
+    snprintf(buf, sizeof(buf), "Battery: %lu mV", (unsigned long)bat_mv);
+    lv_label_set_text(bat, buf);
+    lv_obj_set_style_text_font(bat, &lv_font_montserrat_28, 0);
+    lv_obj_align(bat, LV_ALIGN_CENTER, 0, -50);
+
+    lv_obj_t *temp = lv_label_create(scr);
+    snprintf(buf, sizeof(buf), "%.1f C", temp_c);
+    lv_label_set_text(temp, buf);
+    lv_obj_set_style_text_font(temp, &lv_font_montserrat_32, 0);
+    lv_obj_align(temp, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *hum = lv_label_create(scr);
+    snprintf(buf, sizeof(buf), "%.0f %% RH", humidity);
+    lv_label_set_text(hum, buf);
+    lv_obj_set_style_text_font(hum, &lv_font_montserrat_28, 0);
+    lv_obj_align(hum, LV_ALIGN_CENTER, 0, 50);
 
     ESP_LOGI(TAG, "Rendering...");
     lv_tick_inc(5);
