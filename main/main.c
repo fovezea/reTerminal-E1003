@@ -41,7 +41,7 @@ void app_main(void)
 
     lv_obj_t *title = lv_label_create(scr);
     lv_label_set_text(title, "reTerminal E1003");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_32, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 60);
 
     char buf[64];
@@ -54,7 +54,7 @@ void app_main(void)
     lv_obj_t *temp = lv_label_create(scr);
     snprintf(buf, sizeof(buf), "%.1f C", temp_c);
     lv_label_set_text(temp, buf);
-    lv_obj_set_style_text_font(temp, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_font(temp, &lv_font_montserrat_32, 0);
     lv_obj_align(temp, LV_ALIGN_CENTER, 0, 0);
 
     lv_obj_t *hum = lv_label_create(scr);
