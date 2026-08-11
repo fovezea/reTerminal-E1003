@@ -281,6 +281,7 @@ esp_err_t bsp_sht4x_read(float *temp_c, float *humidity_pct);
 
 esp_err_t bsp_lvgl_display_init(void);
 esp_err_t bsp_lvgl_touch_init(void);
+void     bsp_lvgl_touch_deinit(void);
 esp_err_t bsp_lvgl_tick_init(void);
 
 /** @brief Send the LVGL framebuffer to the panel with ONE e-paper refresh.

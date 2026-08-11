@@ -342,7 +342,8 @@ void bsp_power_down(void)
     /* LED OFF */
     BSP_LED_OFF();
 
-    /* I2C — remove devices first, then delete the bus */
+    /* I2C — remove ALL devices before deleting the bus */
+    bsp_lvgl_touch_deinit();  /* GT911, attached by LVGL port */
     if (s_rtc_dev)   { i2c_master_bus_rm_device(s_rtc_dev);   s_rtc_dev   = NULL; }
     if (s_sht4x_dev) { i2c_master_bus_rm_device(s_sht4x_dev); s_sht4x_dev = NULL; }
     if (s_i2c0_handle) {

@@ -71,8 +71,8 @@ static void wait_hrdy(void)
 {
     int64_t start = esp_timer_get_time() / 1000; /* ms */
     while (gpio_get_level(BSP_DISP_BUSY) == 0) {
-        if ((esp_timer_get_time() / 1000) - start > 2000) {
-            ESP_LOGW(TAG, "HRDY timeout");
+        if ((esp_timer_get_time() / 1000) - start > 4000) {
+            ESP_LOGD(TAG, "HRDY timeout");
             break;
         }
         vTaskDelay(1);   /* feeds the watchdog */

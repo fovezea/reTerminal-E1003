@@ -168,3 +168,11 @@ void bsp_lvgl_panel_update(void)
 {
     panel_update();
 }
+
+void bsp_lvgl_touch_deinit(void)
+{
+    if (s_touch_dev) {
+        i2c_master_bus_rm_device(s_touch_dev);
+        s_touch_dev = NULL;
+    }
+}
