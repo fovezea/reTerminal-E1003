@@ -1,0 +1,134 @@
+# ============================================================================
+# reTerminal E1003 – Official Seeed Studio Configuration
+# ============================================================================
+
+esphome:
+  name: reterminal-e1003
+  friendly_name: "reTerminal E1003"
+
+esp32:
+  variant: esp32s3
+  framework:
+    type: esp-idf
+
+psram:
+  mode: octal
+
+wifi:
+  ssid: "YOUR_SSID"                 # <-- change
+  password: "YOUR_PASSWORD"         # <-- change
+  ap:
+    ssid: "reterminal-e1003"
+    password: "fallback123"
+
+captive_portal:
+
+logger:
+
+# ===== API key – already a valid base64 string =====
+api:
+  encryption:
+    key: "j3Xq9Bp8V1wL7kM2nR5tS6uW4zY8fC0dA1bE2fG3hI4="
+
+ota:
+  - platform: esphome
+    password: "YOUR_OTA_PASSWORD"   # <-- change
+
+# ============================================================
+# SPI Bus – dedicated for the IT8951 display
+# (uses different pins than the board preset to avoid conflict)
+# ============================================================
+spi:
+  id: epaper_spi_bus
+  clk_pin: GPIO7
+  mosi_pin: GPIO9
+  miso_pin: GPIO8   # MISO is required (full‑duplex)
+
+# ============================================================
+# IT8951 display – linked to the dedicated SPI bus
+# ============================================================
+external_components:
+  - source: github://pr#15346
+    components: [it8951]
+    refresh: 1h
+
+display:
+  - platform: it8951
+    id: epaper_display
+    spi_id: epaper_spi_bus
+    model: seeed-reterminal-e1003
+    # cs_pin is not needed – the preset defines it
+    update_interval: 5min
+    lambda: |-
+      it.print(100, 100, id(my_font), Color::BLACK, "Hello reTerminal!");
+      it.print(100, 180, id(my_font), Color::BLACK, "ESPHome Ready");
+
+font:
+  - file: "gfonts://Roboto"
+    id: my_font
+    size: 48
+
+i2c:
+  sda: GPIO19
+  scl: GPIO20
+  scan: true
+
+sensor:
+  - platform: adc
+    name: "Battery Voltage"
+    id: battery_voltage
+    pin: GPIO1
+    update_interval: 10s
+    attenuation: 11db
+    filters:
+      - multiply: 2.0
+    unit_of_measurement: V
+    accuracy_decimals: 2
+    icon: "mdi:battery"
+
+  - platform: sht4x
+    temperature:
+      name: "Temperature"
+    humidity:
+      name: "Humidity"
+    update_interval: 60s
+
+output:
+  - platform: gpio
+    pin:
+      number: GPIO16
+      inverted: true
+    id: onboard_led_output
+
+light:
+  - platform: binary
+    name: "Onboard LED"
+    output: onboard_led_output
+    id: onboard_led_light
+
+binary_sensor:
+  - platform: gpio
+    name: "Button Green"
+    id: button_green
+    pin:
+      number: GPIO3
+      mode: {input: true, pullup: true}
+      inverted: true
+    on_press:
+      - light.toggle: onboard_led_light
+
+  - platform: gpio
+    name: "Button Right"
+    id: button_right
+    pin:
+      number: GPIO4
+      mode: {input: true, pullup: true}
+      inverted: true
+
+  - platform: gpio
+    name: "Button Left"
+    id: button_left
+    pin:
+      number: GPIO5
+      mode: {input: true, pullup: true}
+      inverted: true
