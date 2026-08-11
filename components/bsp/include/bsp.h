@@ -287,6 +287,7 @@ esp_err_t bsp_lvgl_tick_init(void);
 /** @brief Send the LVGL framebuffer to the panel with ONE e-paper refresh.
  *  Call AFTER lv_timer_handler() has rendered all dirty areas. */
 void bsp_lvgl_panel_update(void);
+uint8_t *bsp_lvgl_get_fb(void);
 
 /** @brief Get the I2C0 bus handle (needed by touch driver in lvgl_port.c) */
 i2c_master_bus_handle_t bsp_i2c0_get_handle(void);

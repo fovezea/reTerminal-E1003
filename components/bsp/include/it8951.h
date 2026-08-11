@@ -24,17 +24,22 @@ void it8951_clear_screen(void);
 void it8951_clean_screen(void);
 
 /**
- * @brief Write a full 8BPP (1 byte/pixel) framebuffer and refresh.
- *
- * Matches GxEPD2 _doFullRefresh exactly:
- *   - LD_IMG_AREA: B_ENDIAN, 8BPP, full pixel width
- *   - Data: bytes right-to-left, bits LSB-first within byte
- *   - DPY_AREA: GC16 mode, no UP1SR
- *
- * @param fb8  Full-screen buffer: WIDTH × HEIGHT bytes.
- *             0x00 = black, 0xFF = white.
+ * @brief Write a full 8BPP framebuffer and refresh (proven path).
+ * @param fb8  Full-screen buffer: WIDTH × HEIGHT bytes.  0x00=black, 0xFF=white.
  */
 void it8951_write_8bpp_frame(const uint8_t *fb8);
+
+/**
+ * @brief Write a full 4BPP grayscale framebuffer (ESPHome path).
+ *
+ * Packs 2 pixels/byte from the same 8BPP input: high nibble = even x.
+ * 4bpp data: 0x0 = black … 0xF = white.
+ * LD_IMG_AREA: L_ENDIAN, 4BPP, full pixel width.
+ * Half the SPI traffic of the 8BPP path (~1.3 MB vs 2.6 MB).
+ *
+ * @param fb8  Full-screen buffer: WIDTH × HEIGHT bytes.  0x00=black, 0xFF=white.
+ */
+void it8951_write_4bpp_frame(const uint8_t *fb8);
 
 /**
  * @brief Write 1bpp image data to the IT8951 image buffer.

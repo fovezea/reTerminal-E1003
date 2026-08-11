@@ -199,8 +199,11 @@ esp_err_t it8951_init(void) {
     set_vcom(VCOM_MV);
     read_dev_info();
 
-    /* Temperature must be set — without this IT8951 skips refresh (GxEPD2) */
-    write_cmd(0x0040); write_data(0x0001); write_data(16);
+    /* I80CPCR = 0x0001 per ESPHome driver */
+    write_reg(0x0004, 0x0001);
+
+    /* Temperature = 14 C (ESPHome value) */
+    write_cmd(0x0040); write_data(0x0001); write_data(14);
     ESP_LOGI(TAG, "IT8951 ready");
     return ESP_OK;
 }
@@ -232,7 +235,7 @@ void it8951_clear_screen(void) {
     int64_t t0 = esp_timer_get_time() / 1000;
 
     /* Temperature must be set before every display operation (GxEPD2) */
-    write_cmd(0x0040); write_data(0x0001); write_data(16);
+    write_cmd(0x0040); write_data(0x0001); write_data(14);
 
     set_img_buf_addr();
 
@@ -299,7 +302,7 @@ void it8951_clear_screen(void) {
 void it8951_clean_screen(void) {
     int64_t t0 = esp_timer_get_time() / 1000;
 
-    write_cmd(0x0040); write_data(0x0001); write_data(16);
+    write_cmd(0x0040); write_data(0x0001); write_data(14);
 
     set_img_buf_addr();
 
@@ -380,7 +383,7 @@ void it8951_load_end(void) {
 void it8951_display_area(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     /* Temperature must be set before DPY_AREA — without it IT8951 may skip
      * the refresh (GxEPD2 _doFullRefresh always calls this first). */
-    write_cmd(0x0040); write_data(0x0001); write_data(16);
+    write_cmd(0x0040); write_data(0x0001); write_data(14);
 
     uint16_t x_flip = (PANEL_W - 1) - x - w + 1;
 
@@ -407,13 +410,77 @@ void it8951_display_area(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
 }
 
 /* ==========================================================================
+ * 4BPP full-frame — ESPHome-style grayscale path
+ * Packs 2 pixels per byte (high nibble = even x), width = PANEL_W/2 bytes.
+ * 4bpp data: 0x0=black … 0xF=white.
+ * ========================================================================== */
+void it8951_write_4bpp_frame(const uint8_t *fb8)
+{
+    int64_t t0 = esp_timer_get_time() / 1000;
+    uint16_t row_bytes_4bpp = PANEL_W / 2;  /* 936 */
+
+    write_cmd(0x0040); write_data(0x0001); write_data(14);
+
+    /* LD_IMG_AREA: L_ENDIAN, 4BPP, full pixel width */
+    {
+        uint16_t args[5];
+        args[0] = (0 << 8) | (2 << 4) | 0;  /* L_ENDIAN, 4BPP, ROTATE_0 */
+        args[1] = 0;
+        args[2] = 0;
+        args[3] = PANEL_W;    /* width in PIXELS */
+        args[4] = PANEL_H;
+        write_cmd(CMD_LD_IMG_AREA);
+        for (int i = 0; i < 5; i++) write_data(args[i]);
+    }
+
+    /* One 0x0000 preamble, then stream 4bpp packed bytes.
+     * X-mirror: reverse bytes within each row. */
+    cs_low(); wait_hrdy(); xfer16(PRE_WRITE_DATA); wait_hrdy();
+
+    uint8_t *row_4bpp = malloc(row_bytes_4bpp);
+    assert(row_4bpp);
+
+    for (uint16_t row = 0; row < PANEL_H; row++) {
+        /* Convert 8BPP → 4BPP: shift right by 4 bits, pack 2 pixels/byte.
+         * X-mirror: process source pixels right-to-left. */
+        for (int32_t col = 0; col < PANEL_W; col += 2) {
+            uint8_t p0 = fb8[(uint32_t)row * PANEL_W + (PANEL_W - 1 - col)];     /* even, left */
+            uint8_t p1 = fb8[(uint32_t)row * PANEL_W + (PANEL_W - 2 - col)];     /* odd, right */
+            row_4bpp[col / 2] = ((p0 >> 4) << 4) | (p1 >> 4);
+        }
+        xfer8n(row_4bpp, row_bytes_4bpp);
+        if ((row & 0x3F) == 0) vTaskDelay(1);
+    }
+    free(row_4bpp);
+    cs_high();
+
+    write_cmd(CMD_LD_IMG_END); wait_hrdy();
+
+    /* DPY_AREA — GC16, no UP1SR needed for 4BPP */
+    write_cmd(CMD_DPY_AREA);
+    write_data(0); write_data(0);
+    write_data(PANEL_W); write_data(PANEL_H);
+    write_data(2);  /* GC16 */
+    wait_hrdy();
+
+    /* Wait for refresh */
+    int64_t t1 = esp_timer_get_time() / 1000;
+    while (gpio_get_level(BSP_DISP_BUSY) == 0) {
+        if ((esp_timer_get_time() / 1000) - t1 > 15000) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGI(TAG, "4BPP frame: %lld ms", (long long)(esp_timer_get_time() / 1000 - t0));
+}
+
+/* ==========================================================================
  * 8BPP full-frame — GxEPD2 _doFullRefresh clone (proven working path)
  * ========================================================================== */
 void it8951_write_8bpp_frame(const uint8_t *fb8)
 {
     int64_t t0 = esp_timer_get_time() / 1000;
 
-    write_cmd(0x0040); write_data(0x0001); write_data(16);
+    write_cmd(0x0040); write_data(0x0001); write_data(14);
 
     /* LD_IMG_AREA: B_ENDIAN, 8BPP, full pixel width */
     {

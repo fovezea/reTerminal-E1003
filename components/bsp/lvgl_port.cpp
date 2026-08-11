@@ -39,7 +39,9 @@ static bool px_is_dark(uint16_t c)
     uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
     uint32_t g = ((c >>  5) & 0x3F) * 255 / 63;
     uint32_t b = ( c        & 0x1F) * 255 / 31;
-    return (r + g + b) < (128 * 3);
+    /* Perceptual luminance (ITU-R BT.601) with Seeed threshold */
+    uint32_t lum = (r * 30) + (g * 59) + (b * 11);
+    return lum < (180 * 100);  /* EPAPER_MONO_THRESHOLD */
 }
 
 static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
@@ -66,7 +68,9 @@ static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
  * ========================================================================== */
 static void panel_update(void)
 {
-    it8951_write_8bpp_frame(s_fb);
+    /* 4BPP grayscale: half the SPI traffic, 16 gray levels.
+     * Anti-aliased font edges render as smooth grayscale. */
+    it8951_write_4bpp_frame(s_fb);
 }
 
 /* ==========================================================================
@@ -164,6 +168,8 @@ esp_err_t bsp_lvgl_tick_init(void)
 /* ==========================================================================
  * Public API
  * ========================================================================== */
+uint8_t *bsp_lvgl_get_fb(void) { return s_fb; }
+
 void bsp_lvgl_panel_update(void)
 {
     panel_update();
