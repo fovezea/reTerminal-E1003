@@ -27,22 +27,22 @@ static lv_display_t  *s_disp  = NULL;
 static lv_indev_t    *s_indev = NULL;
 static i2c_master_dev_handle_t s_touch_dev = NULL;
 
-/* Full-screen 8BPP framebuffer: W×H bytes, 0x00=black, 0xFF=white */
-static uint8_t *s_fb = NULL;
-
 /* ==========================================================================
- * Flush callback — RGB565 → 8BPP framebuffer
+ * Flush callback — RGB565 → 4BPP packed framebuffer
  * ========================================================================== */
 
-static bool px_is_dark(uint16_t c)
+/* Convert RGB565 → 4-bit gray (0=black, 15=white), perceptual weights. */
+static uint8_t rgb565_to_4bit(uint16_t c)
 {
     uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
     uint32_t g = ((c >>  5) & 0x3F) * 255 / 63;
     uint32_t b = ( c        & 0x1F) * 255 / 31;
-    /* Perceptual luminance (ITU-R BT.601) with Seeed threshold */
-    uint32_t lum = (r * 30) + (g * 59) + (b * 11);
-    return lum < (180 * 100);  /* EPAPER_MONO_THRESHOLD */
+    uint32_t lum = (r * 30 + g * 59 + b * 11) / 100; /* 0..255 */
+    return (uint8_t)(lum >> 4);  /* 0..15 */
 }
+
+/* 4BPP framebuffer: 2 pixels per byte, even x = high nibble */
+static uint8_t *s_fb_4bpp = NULL;
 
 static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
                           uint8_t *px_map)
@@ -51,12 +51,19 @@ static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
     uint16_t h = (uint16_t)(area->y2 - area->y1 + 1);
     const uint16_t *pixels = (const uint16_t *)px_map;
 
+    /* Convert RGB565 → 4bpp and pack directly into 4BPP framebuffer.
+     * Anti-aliased edges preserved as gray levels 0–15. */
     for (uint16_t row = 0; row < h; row++) {
         uint32_t y = (uint32_t)(area->y1 + row);
         for (uint16_t col = 0; col < w; col++) {
             uint32_t x = (uint32_t)(area->x1 + col);
-            s_fb[y * BSP_LCD_WIDTH + x] = px_is_dark(pixels[row * w + col])
-                                           ? 0x00 : 0xFF;
+            uint8_t gray = rgb565_to_4bit(pixels[row * w + col]);
+            /* Pack: even x → high nibble, odd x → low nibble */
+            uint32_t bi = ((uint32_t)y * BSP_LCD_WIDTH + x) / 2;
+            if (x & 1)
+                s_fb_4bpp[bi] = (s_fb_4bpp[bi] & 0xF0) | gray;
+            else
+                s_fb_4bpp[bi] = (s_fb_4bpp[bi] & 0x0F) | (gray << 4);
         }
     }
 
@@ -68,9 +75,8 @@ static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
  * ========================================================================== */
 static void panel_update(void)
 {
-    /* 4BPP grayscale: half the SPI traffic, 16 gray levels.
-     * Anti-aliased font edges render as smooth grayscale. */
-    it8951_write_4bpp_frame(s_fb);
+    /* Send pre-packed 4BPP framebuffer directly — no conversion needed */
+    it8951_write_4bpp_packed(s_fb_4bpp);
 }
 
 /* ==========================================================================
@@ -78,11 +84,12 @@ static void panel_update(void)
  * ========================================================================== */
 esp_err_t bsp_lvgl_display_init(void)
 {
-    /* Full-screen 8BPP framebuffer: 1872 × 1404 = 2.6 MB */
-    size_t fb_size = (size_t)BSP_LCD_WIDTH * BSP_LCD_HEIGHT;
-    s_fb = (uint8_t *)heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM);
-    if (!s_fb) { ESP_LOGE(TAG, "8BPP fb alloc failed"); return ESP_ERR_NO_MEM; }
-    memset(s_fb, 0xFF, fb_size);  /* all white */
+    /* 4BPP packed framebuffer: 1872 × 1404 / 2 = 1.25 MB.
+     * Flush callback packs RGB565 → 4-bit nibbles directly. */
+    size_t fb_size = (size_t)BSP_LCD_WIDTH * BSP_LCD_HEIGHT / 2;
+    s_fb_4bpp = (uint8_t *)heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM);
+    if (!s_fb_4bpp) { ESP_LOGE(TAG, "4BPP fb alloc failed"); return ESP_ERR_NO_MEM; }
+    memset(s_fb_4bpp, 0xFF, fb_size);  /* all white (0xFF = 0x0F·0x0F) */
 
     esp_err_t ret = it8951_init();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "IT8951 init failed"); return ret; }
@@ -102,7 +109,7 @@ esp_err_t bsp_lvgl_display_init(void)
     lv_display_set_buffers(s_disp, lv_buf, NULL, buf_bytes,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    ESP_LOGI(TAG, "8BPP fb=%u KB, LVGL buf=%u lines",
+    ESP_LOGI(TAG, "4BPP packed fb=%u KB, LVGL buf=%u lines",
              (unsigned)(fb_size / 1024), (unsigned)buf_lines);
     return ESP_OK;
 }
@@ -168,8 +175,6 @@ esp_err_t bsp_lvgl_tick_init(void)
 /* ==========================================================================
  * Public API
  * ========================================================================== */
-uint8_t *bsp_lvgl_get_fb(void) { return s_fb; }
-
 void bsp_lvgl_panel_update(void)
 {
     panel_update();

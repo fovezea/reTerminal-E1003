@@ -474,6 +474,57 @@ void it8951_write_4bpp_frame(const uint8_t *fb8)
 }
 
 /* ==========================================================================
+ * 4BPP packed — pre-packed data, no 8BPP→4BPP conversion overhead
+ * ========================================================================== */
+void it8951_write_4bpp_packed(const uint8_t *fb4)
+{
+    int64_t t0 = esp_timer_get_time() / 1000;
+    uint16_t row_bytes_4bpp = PANEL_W / 2;  /* 936 */
+
+    write_cmd(0x0040); write_data(0x0001); write_data(14);
+
+    {
+        uint16_t args[5];
+        args[0] = (0 << 8) | (2 << 4) | 0;  /* L_ENDIAN, 4BPP, ROTATE_0 */
+        args[1] = 0; args[2] = 0;
+        args[3] = PANEL_W; args[4] = PANEL_H;
+        write_cmd(CMD_LD_IMG_AREA);
+        for (int i = 0; i < 5; i++) write_data(args[i]);
+    }
+
+    cs_low(); wait_hrdy(); xfer16(PRE_WRITE_DATA); wait_hrdy();
+
+    /* X-mirror: reverse bytes within each row */
+    uint8_t *rev = malloc(row_bytes_4bpp);
+    assert(rev);
+    for (uint16_t row = 0; row < PANEL_H; row++) {
+        const uint8_t *rp = fb4 + (uint32_t)row * row_bytes_4bpp;
+        for (int32_t b = 0; b < row_bytes_4bpp; b++)
+            rev[b] = rp[row_bytes_4bpp - 1 - b];
+        xfer8n(rev, row_bytes_4bpp);
+        if ((row & 0x3F) == 0) vTaskDelay(1);
+    }
+    free(rev);
+    cs_high();
+
+    write_cmd(CMD_LD_IMG_END); wait_hrdy();
+
+    write_cmd(CMD_DPY_AREA);
+    write_data(0); write_data(0);
+    write_data(PANEL_W); write_data(PANEL_H);
+    write_data(2);  /* GC16 */
+    wait_hrdy();
+
+    int64_t t1 = esp_timer_get_time() / 1000;
+    while (gpio_get_level(BSP_DISP_BUSY) == 0) {
+        if ((esp_timer_get_time() / 1000) - t1 > 15000) break;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    ESP_LOGI(TAG, "4BPP packed: %lld ms", (long long)(esp_timer_get_time() / 1000 - t0));
+}
+
+/* ==========================================================================
  * 8BPP full-frame — GxEPD2 _doFullRefresh clone (proven working path)
  * ========================================================================== */
 void it8951_write_8bpp_frame(const uint8_t *fb8)

@@ -40,6 +40,7 @@ void it8951_write_8bpp_frame(const uint8_t *fb8);
  * @param fb8  Full-screen buffer: WIDTH × HEIGHT bytes.  0x00=black, 0xFF=white.
  */
 void it8951_write_4bpp_frame(const uint8_t *fb8);
+void it8951_write_4bpp_packed(const uint8_t *fb4);  /* pre-packed 4bpp */
 
 /**
  * @brief Write 1bpp image data to the IT8951 image buffer.
