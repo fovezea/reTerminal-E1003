@@ -1,12 +1,12 @@
 /*
  * lvgl_port.cpp — LVGL integration for reTerminal E1003
  *
- * Architecture (proven working):
- *   LVGL renders RGB565 into a PARTIAL buffer.
- *   Flush callback converts RGB565 → 8BPP (0x00 black, 0xFF white)
- *   into a full-screen 8BPP framebuffer.
- *   After LVGL, panel_update() sends via it8951_write_8bpp_frame()
- *   which uses the proven 8BPP expanded path with bulk xfer8n.
+ * Architecture (16-level grayscale):
+ *   LVGL renders RGB565 with full anti-aliasing into a PARTIAL buffer.
+ *   Flush callback converts RGB565 → 4-bit gray (0–15), preserving
+ *   anti-aliased letter edges, and packs into a full-screen 4BPP framebuffer.
+ *   panel_update() uploads via it8951_write_4bpp_packed(), which expands to
+ *   the proven 8BPP path and refreshes with GC16 (16 gray levels).
  */
 
 #include "bsp.h"
@@ -28,21 +28,23 @@ static lv_indev_t    *s_indev = NULL;
 static i2c_master_dev_handle_t s_touch_dev = NULL;
 
 /* ==========================================================================
- * Flush callback — RGB565 → 4BPP packed framebuffer
+ * Flush callback — RGB565 → 4BPP packed grayscale framebuffer
  * ========================================================================== */
 
-/* Convert RGB565 → 4-bit gray (0=black, 15=white), perceptual weights. */
-static uint8_t rgb565_to_4bit(uint16_t c)
+/* 4BPP packed framebuffer: 2 pixels per byte, even x = high nibble */
+static uint8_t *s_fb_4bpp = NULL;
+
+/* Convert one RGB565 pixel to 4-bit gray (0=black … 15=white).
+ * Perceptual luminance weights, rounded to the nearest of 16 levels so the
+ * anti-aliased edges LVGL produces are preserved rather than thresholded. */
+static uint8_t rgb565_to_gray4(uint16_t c)
 {
     uint32_t r = ((c >> 11) & 0x1F) * 255 / 31;
     uint32_t g = ((c >>  5) & 0x3F) * 255 / 63;
     uint32_t b = ( c        & 0x1F) * 255 / 31;
-    uint32_t lum = (r * 30 + g * 59 + b * 11) / 100; /* 0..255 */
-    return (uint8_t)(lum >> 4);  /* 0..15 */
+    uint32_t lum = (r * 30 + g * 59 + b * 11) / 100;  /* 0..255 */
+    return (uint8_t)((lum + 8) / 17);                 /* round → 0..15 */
 }
-
-/* 4BPP framebuffer: 2 pixels per byte, even x = high nibble */
-static uint8_t *s_fb_4bpp = NULL;
 
 static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
                           uint8_t *px_map)
@@ -51,14 +53,13 @@ static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
     uint16_t h = (uint16_t)(area->y2 - area->y1 + 1);
     const uint16_t *pixels = (const uint16_t *)px_map;
 
-    /* Convert RGB565 → 4bpp and pack directly into 4BPP framebuffer.
-     * Anti-aliased edges preserved as gray levels 0–15. */
+    /* RGB565 → 4bpp gray.  Edge pixels keep their intermediate level. */
     for (uint16_t row = 0; row < h; row++) {
         uint32_t y = (uint32_t)(area->y1 + row);
         for (uint16_t col = 0; col < w; col++) {
             uint32_t x = (uint32_t)(area->x1 + col);
-            uint8_t gray = rgb565_to_4bit(pixels[row * w + col]);
-            /* Pack: even x → high nibble, odd x → low nibble */
+            uint8_t gray = rgb565_to_gray4(pixels[row * w + col]);
+
             uint32_t bi = ((uint32_t)y * BSP_LCD_WIDTH + x) / 2;
             if (x & 1)
                 s_fb_4bpp[bi] = (s_fb_4bpp[bi] & 0xF0) | gray;
@@ -71,11 +72,10 @@ static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area,
 }
 
 /* ==========================================================================
- * Panel update — proven 8BPP path
+ * Panel update
  * ========================================================================== */
 static void panel_update(void)
 {
-    /* Send pre-packed 4BPP framebuffer directly — no conversion needed */
     it8951_write_4bpp_packed(s_fb_4bpp);
 }
 
@@ -84,12 +84,11 @@ static void panel_update(void)
  * ========================================================================== */
 esp_err_t bsp_lvgl_display_init(void)
 {
-    /* 4BPP packed framebuffer: 1872 × 1404 / 2 = 1.25 MB.
-     * Flush callback packs RGB565 → 4-bit nibbles directly. */
+    /* 4BPP packed framebuffer: 1872 × 1404 / 2 = 1.25 MB */
     size_t fb_size = (size_t)BSP_LCD_WIDTH * BSP_LCD_HEIGHT / 2;
     s_fb_4bpp = (uint8_t *)heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM);
     if (!s_fb_4bpp) { ESP_LOGE(TAG, "4BPP fb alloc failed"); return ESP_ERR_NO_MEM; }
-    memset(s_fb_4bpp, 0xFF, fb_size);  /* all white (0xFF = 0x0F·0x0F) */
+    memset(s_fb_4bpp, 0xFF, fb_size);  /* all white (0xFF = 0xF·0xF) */
 
     esp_err_t ret = it8951_init();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "IT8951 init failed"); return ret; }
@@ -98,8 +97,11 @@ esp_err_t bsp_lvgl_display_init(void)
 
     s_disp = lv_display_create(BSP_LCD_WIDTH, BSP_LCD_HEIGHT);
     lv_display_set_flush_cb(s_disp, disp_flush_cb);
+
+    /* RGB565: LVGL renders with full anti-aliasing; flush maps to 16 grays */
     lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565);
 
+    /* RGB565 buffer: 1872 × 2 bytes/row × 20 lines ≈ 73 KB */
     const uint32_t buf_lines = 20;
     size_t buf_bytes = (size_t)BSP_LCD_WIDTH * buf_lines * 2;  /* RGB565 */
     uint8_t *lv_buf = (uint8_t *)heap_caps_malloc(buf_bytes,
@@ -109,8 +111,8 @@ esp_err_t bsp_lvgl_display_init(void)
     lv_display_set_buffers(s_disp, lv_buf, NULL, buf_bytes,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    ESP_LOGI(TAG, "4BPP packed fb=%u KB, LVGL buf=%u lines",
-             (unsigned)(fb_size / 1024), (unsigned)buf_lines);
+    ESP_LOGI(TAG, "RGB565→4BPP gray — fb=%u KB, LVGL buf=%u bytes (%u lines)",
+             (unsigned)(fb_size / 1024), (unsigned)buf_bytes, (unsigned)buf_lines);
     return ESP_OK;
 }
 

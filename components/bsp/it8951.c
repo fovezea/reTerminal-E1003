@@ -474,7 +474,20 @@ void it8951_write_4bpp_frame(const uint8_t *fb8)
 }
 
 /* ==========================================================================
- * 4BPP packed — pre-packed data, no 8BPP→4BPP conversion overhead
+ * 4BPP packed — pre-packed grayscale (2 px/byte, high nibble = left pixel)
+ *
+ * Uploaded exactly like the proven Seeed GxEPD2_reTerminal_E1003_Gray16
+ * reference: the 4bpp canvas is expanded to 8BPP on the fly (nibble × 17,
+ * so 0x0→0x00 … 0xF→0xFF) and loaded via the proven 8BPP B_ENDIAN path.
+ *
+ * Why expand instead of a native 4BPP load:
+ *  - In native 4BPP each byte holds two pixels, so X-mirroring requires both
+ *    reversing the bytes AND swapping the nibbles inside each byte.  Getting
+ *    either wrong swaps adjacent pixels and wrecks anti-aliased edges.
+ *  - Expanding to 8BPP makes every pixel its own byte, so X-mirror is a
+ *    simple, correct "send pixels right-to-left".  GC16 reads the top 4 bits
+ *    of each 8bpp value, and (n × 17) always has top nibble == n, so all 16
+ *    gray levels land exactly.
  * ========================================================================== */
 void it8951_write_4bpp_packed(const uint8_t *fb4)
 {
@@ -483,32 +496,43 @@ void it8951_write_4bpp_packed(const uint8_t *fb4)
 
     write_cmd(0x0040); write_data(0x0001); write_data(14);
 
+    set_img_buf_addr();
+
+    /* LD_IMG_AREA as 8BPP, B_ENDIAN — the proven Gray16 upload mode */
     {
         uint16_t args[5];
-        args[0] = (0 << 8) | (2 << 4) | 0;  /* L_ENDIAN, 4BPP, ROTATE_0 */
+        args[0] = (1 << 8) | (3 << 4) | 0;  /* B_ENDIAN, 8BPP, ROTATE_0 */
         args[1] = 0; args[2] = 0;
-        args[3] = PANEL_W; args[4] = PANEL_H;
+        args[3] = PANEL_W;    /* width in PIXELS */
+        args[4] = PANEL_H;
         write_cmd(CMD_LD_IMG_AREA);
         for (int i = 0; i < 5; i++) write_data(args[i]);
     }
 
     cs_low(); wait_hrdy(); xfer16(PRE_WRITE_DATA); wait_hrdy();
 
-    /* X-mirror: reverse bytes within each row */
-    uint8_t *rev = malloc(row_bytes_4bpp);
-    assert(rev);
+    /* Expand 4bpp→8bpp, X-mirrored.  Walk source bytes right-to-left; within
+     * each byte send the low nibble (right pixel) first, then the high nibble
+     * (left pixel), each ×17.  Result: row_8bpp holds the mirrored 8bpp row. */
+    uint8_t *row_8bpp = malloc(PANEL_W);
+    assert(row_8bpp);
     for (uint16_t row = 0; row < PANEL_H; row++) {
         const uint8_t *rp = fb4 + (uint32_t)row * row_bytes_4bpp;
-        for (int32_t b = 0; b < row_bytes_4bpp; b++)
-            rev[b] = rp[row_bytes_4bpp - 1 - b];
-        xfer8n(rev, row_bytes_4bpp);
-        if ((row & 0x3F) == 0) vTaskDelay(1);
+        uint32_t out = 0;
+        for (int32_t b = row_bytes_4bpp - 1; b >= 0; b--) {
+            uint8_t byte_val = rp[b];
+            row_8bpp[out++] = (uint8_t)((byte_val & 0x0F) * 17);  /* right px */
+            row_8bpp[out++] = (uint8_t)((byte_val >> 4)   * 17);  /* left px  */
+        }
+        xfer8n(row_8bpp, PANEL_W);
+        if ((row & 0x3F) == 0) vTaskDelay(1);  /* feed watchdog */
     }
-    free(rev);
+    free(row_8bpp);
     cs_high();
 
     write_cmd(CMD_LD_IMG_END); wait_hrdy();
 
+    /* DPY_AREA — GC16 renders the 16 gray levels */
     write_cmd(CMD_DPY_AREA);
     write_data(0); write_data(0);
     write_data(PANEL_W); write_data(PANEL_H);
@@ -521,7 +545,7 @@ void it8951_write_4bpp_packed(const uint8_t *fb4)
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 
-    ESP_LOGI(TAG, "4BPP packed: %lld ms", (long long)(esp_timer_get_time() / 1000 - t0));
+    ESP_LOGI(TAG, "4BPP gray frame: %lld ms", (long long)(esp_timer_get_time() / 1000 - t0));
 }
 
 /* ==========================================================================

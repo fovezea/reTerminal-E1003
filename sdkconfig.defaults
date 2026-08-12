@@ -72,6 +72,12 @@ CONFIG_LV_FONT_MONTSERRAT_32=y
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=120
 
 #
+#
+# Main task stack — LVGL rendering needs more than the 3584 B default
+#
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=10240
+
+#
 # Log level
 #
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
