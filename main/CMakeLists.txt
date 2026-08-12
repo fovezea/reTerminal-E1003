@@ -8,4 +8,6 @@ idf_component_register(
         driver
         esp_psram
         spi_flash
+        wifi_manager
+        esp_timer
 )

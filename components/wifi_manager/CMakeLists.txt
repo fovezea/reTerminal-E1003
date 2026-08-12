@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "wifi_manager.c"
+    INCLUDE_DIRS
+        "include"
+    EMBED_TXTFILES
+        "www/index.html"
+    REQUIRES
+        esp_wifi
+        esp_netif
+        esp_event
+        nvs_flash
+        esp_http_server
+        esp_timer
+        freertos
+        log
+)
