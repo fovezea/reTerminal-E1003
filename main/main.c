@@ -252,10 +252,27 @@ static bool run_provisioning_portal(void)
 
 /* ── Dashboard screen ─────────────────────────────────────────────────── */
 
+typedef struct {
+    int   offset_min;      /* UTC offset in minutes            */
+    float lat, lon;        /* position of our public IP        */
+    char  city[32];
+    bool  has_pos;
+} geo_info_t;
+
+typedef struct {
+    bool  ok;
+    float temp_c;
+    int   code;            /* WMO weather code */
+    float wind_kmh;
+} weather_t;
+
+static geo_info_t s_geo;                 /* last lookup result (or NVS cache) */
+static const char *wmo_text(int code);   /* defined further down */
+
 static lv_obj_t *create_dashboard_screen(int pct, float temp_c, float humidity,
                                          const bsp_rtc_time_t *rtc, bool rtc_ok,
                                          uint32_t bat_mv, bool wifi_on,
-                                         const char *wifi_ip)
+                                         const char *wifi_ip, const weather_t *w)
 {
     lv_obj_t *scr = lv_obj_create(NULL);
     lv_obj_set_style_bg_color(scr, lv_color_white(), 0);
@@ -324,6 +341,32 @@ static lv_obj_t *create_dashboard_screen(int pct, float temp_c, float humidity,
     create_card(scr, "Battery Voltage", buf,
                 card_x0 + wide_w + gap, row2_y, card_w, card_h);
 
+    /* Third row: outdoor weather (only when we managed to fetch it) */
+    if (w && w->ok) {
+        int row3_y = row2_y + card_h + 40;
+
+        snprintf(buf, sizeof(buf), "%.1f °C", w->temp_c);
+        create_card(scr, "Outdoor Temp", buf, card_x0, row3_y, card_w, card_h);
+
+        create_card(scr, "Conditions", wmo_text(w->code),
+                    card_x0 + card_w + gap, row3_y, card_w, card_h);
+
+        snprintf(buf, sizeof(buf), "%.0f km/h", w->wind_kmh);
+        create_card(scr, "Wind", buf,
+                    card_x0 + 2 * (card_w + gap), row3_y, card_w, card_h);
+
+        char cap[64];
+        if (s_geo.city[0])
+            snprintf(cap, sizeof(cap), "%s — open-meteo.com", s_geo.city);
+        else
+            snprintf(cap, sizeof(cap), "open-meteo.com");
+        lv_obj_t *cap_lbl = lv_label_create(scr);
+        lv_label_set_text(cap_lbl, cap);
+        lv_obj_set_style_text_font(cap_lbl, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_color(cap_lbl, lv_color_hex(0x888888), 0);
+        lv_obj_align(cap_lbl, LV_ALIGN_TOP_MID, 0, row3_y + card_h + 12);
+    }
+
     /* RTC voltage-low warning */
     if (rtc_ok && !rtc->voltage_ok) {
         lv_obj_t *warn = lv_label_create(scr);
@@ -341,11 +384,15 @@ static lv_obj_t *create_dashboard_screen(int pct, float temp_c, float humidity,
 #define SNTP_SYNC_TIMEOUT_MS  20000
 #define TIME_NVS_NAMESPACE    "time"
 #define TIME_NVS_KEY_OFFSET   "utc_off"   /* last known UTC offset, minutes */
+#define TIME_NVS_KEY_LAT      "lat_i"     /* last known latitude  × 10000 */
+#define TIME_NVS_KEY_LON      "lon_i"     /* last known longitude × 10000 */
+#define TIME_NVS_KEY_CITY     "city"
 
-/* Fetch `"<anchor>" ... "offset":<seconds>` from a geo-IP service.
- * Auto-redirect is disabled so a captive portal that hijacks the request
- * fails fast instead of dragging us into a TLS handshake. */
-static bool fetch_offset(const char *url, const char *anchor, int *offset_min)
+
+/* Small HTTP(S) GET into a buffer.  Auto-redirect is disabled so a captive
+ * portal that hijacks the request fails fast instead of dragging us into a
+ * TLS handshake. */
+static bool http_get(const char *url, char *resp, size_t resp_len)
 {
     esp_http_client_config_t cfg = {
         .url = url,
@@ -356,29 +403,19 @@ static bool fetch_offset(const char *url, const char *anchor, int *offset_min)
     esp_http_client_handle_t cl = esp_http_client_init(&cfg);
     if (!cl) return false;
 
-    static char resp[2048];
     bool ok = false;
     if (esp_http_client_open(cl, 0) == ESP_OK) {
         esp_http_client_fetch_headers(cl);
         if (esp_http_client_get_status_code(cl) == 200) {
             int total = 0;
-            while (total < (int)sizeof(resp) - 1) {
+            while (total < (int)resp_len - 1) {
                 int r = esp_http_client_read(cl, resp + total,
-                                             sizeof(resp) - 1 - total);
+                                             resp_len - 1 - total);
                 if (r <= 0) break;
                 total += r;
             }
             resp[total] = '\0';
-
-            const char *p = anchor ? strstr(resp, anchor) : resp;
-            if (p) p = strstr(p, "\"offset\":");
-            if (p) {
-                int sec = 0;
-                if (sscanf(p + 9, "%d", &sec) == 1) {
-                    *offset_min = sec / 60;
-                    ok = true;
-                }
-            }
+            ok = (total > 0);
         }
     }
     esp_http_client_close(cl);
@@ -386,40 +423,117 @@ static bool fetch_offset(const char *url, const char *anchor, int *offset_min)
     return ok;
 }
 
-/* Ask geo-IP services for the current UTC offset (daylight saving
- * included) of our public IP, so the timezone follows us when we travel.
- * Several sources are tried in order — reachability varies by country. */
-static bool geo_lookup_offset(int *offset_min)
+/* Tiny JSON helpers for the flat, well-known responses we fetch. */
+static bool json_float(const char *json, const char *key, float *out)
 {
-    /* Plain HTTP; {"status":"success","offset":28800} */
-    if (fetch_offset("http://ip-api.com/json/?fields=status,offset",
-                     NULL, offset_min)) return true;
-    /* HTTPS (Let's Encrypt); {"timezone":{...,"offset":28800,...}} */
-    if (fetch_offset("https://ipwho.is/", "\"timezone\"", offset_min))
+    const char *p = strstr(json, key);
+    if (!p) return false;
+    return sscanf(p + strlen(key), "%f", out) == 1;
+}
+
+static bool json_int(const char *json, const char *key, int *out)
+{
+    const char *p = strstr(json, key);
+    if (!p) return false;
+    return sscanf(p + strlen(key), "%d", out) == 1;
+}
+
+static bool json_str(const char *json, const char *key, char *out, size_t out_len)
+{
+    const char *p = strstr(json, key);
+    if (!p) return false;
+    p = strchr(p + strlen(key), '"');        /* opening quote of the value */
+    if (!p) return false;
+    p++;
+    size_t i = 0;
+    while (*p && *p != '"' && i < out_len - 1) out[i++] = *p++;
+    out[i] = '\0';
+    return i > 0;
+}
+
+/* Geo-IP lookup: UTC offset (daylight saving included) + position + city
+ * of our public IP — used for the timezone and for the weather.  Several
+ * sources are tried in order; reachability varies by country. */
+static bool geo_lookup(geo_info_t *info)
+{
+    static char resp[2048];
+    int sec = 0;
+
+    /* ip-api.com — plain HTTP, offset + position in one request */
+    if (http_get("http://ip-api.com/json/?fields=status,offset,lat,lon,city",
+                 resp, sizeof(resp)) &&
+        json_int(resp, "\"offset\":", &sec)) {
+        info->offset_min = sec / 60;
+        float lat = 0, lon = 0;
+        if (json_float(resp, "\"lat\":", &lat) &&
+            json_float(resp, "\"lon\":", &lon) &&
+            (lat != 0 || lon != 0)) {
+            info->lat = lat;
+            info->lon = lon;
+            info->has_pos = true;
+            json_str(resp, "\"city\":", info->city, sizeof(info->city));
+        }
         return true;
+    }
+
+    /* ipwho.is — HTTPS fallback (Let's Encrypt) */
+    sec = 0;
+    if (http_get("https://ipwho.is/", resp, sizeof(resp))) {
+        const char *tz = strstr(resp, "\"timezone\"");
+        if (tz && json_int(tz, "\"offset\":", &sec)) {
+            info->offset_min = sec / 60;
+            float lat = 0, lon = 0;
+            if (json_float(resp, "\"latitude\":", &lat) &&
+                json_float(resp, "\"longitude\":", &lon) &&
+                (lat != 0 || lon != 0)) {
+                info->lat = lat;
+                info->lon = lon;
+                info->has_pos = true;
+                json_str(resp, "\"city\":", info->city, sizeof(info->city));
+            }
+            return true;
+        }
+    }
     return false;
 }
 
-static void cache_tz_offset(int minutes)
+static void cache_geo(const geo_info_t *info)
 {
     nvs_handle_t h;
-    if (nvs_open(TIME_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
-        nvs_set_i32(h, TIME_NVS_KEY_OFFSET, minutes);
-        nvs_commit(h);
-        nvs_close(h);
+    if (nvs_open(TIME_NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) return;
+    nvs_set_i32(h, TIME_NVS_KEY_OFFSET, info->offset_min);
+    if (info->has_pos) {
+        nvs_set_i32(h, TIME_NVS_KEY_LAT, (int32_t)(info->lat * 10000.0f));
+        nvs_set_i32(h, TIME_NVS_KEY_LON, (int32_t)(info->lon * 10000.0f));
+        if (info->city[0]) nvs_set_str(h, TIME_NVS_KEY_CITY, info->city);
     }
+    nvs_commit(h);
+    nvs_close(h);
 }
 
-static bool cached_tz_offset(int *minutes)
+/* Load the cached location info.  The offset is required, the position is
+ * optional (older firmware only cached the offset). */
+static bool cached_geo(geo_info_t *info)
 {
     nvs_handle_t h;
     if (nvs_open(TIME_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
-    int32_t v = 0;
-    esp_err_t e = nvs_get_i32(h, TIME_NVS_KEY_OFFSET, &v);
+    int32_t off = 0;
+    esp_err_t e = nvs_get_i32(h, TIME_NVS_KEY_OFFSET, &off);
+    if (e == ESP_OK) {
+        info->offset_min = off;
+        int32_t lat = 0, lon = 0;
+        if (nvs_get_i32(h, TIME_NVS_KEY_LAT, &lat) == ESP_OK &&
+            nvs_get_i32(h, TIME_NVS_KEY_LON, &lon) == ESP_OK &&
+            (lat != 0 || lon != 0)) {
+            info->lat = lat / 10000.0f;
+            info->lon = lon / 10000.0f;
+            info->has_pos = true;
+            size_t cl = sizeof(info->city);
+            nvs_get_str(h, TIME_NVS_KEY_CITY, info->city, &cl);
+        }
+    }
     nvs_close(h);
-    if (e != ESP_OK) return false;
-    *minutes = v;
-    return true;
+    return e == ESP_OK;
 }
 
 /* POSIX TZ string from a UTC offset in minutes.  Note the sign flip:
@@ -469,11 +583,11 @@ static bool sntp_sync(uint32_t timeout_ms)
  * then to UTC).  Writes the result into the PCF8563 RTC. */
 static bool sync_time_from_internet(void)
 {
-    int offset_min;
-    if (geo_lookup_offset(&offset_min)) {
-        cache_tz_offset(offset_min);
-    } else if (cached_tz_offset(&offset_min)) {
-        ESP_LOGW(TAG, "Geo-IP lookup failed — using last known UTC offset");
+    memset(&s_geo, 0, sizeof(s_geo));
+    if (geo_lookup(&s_geo)) {
+        cache_geo(&s_geo);
+    } else if (cached_geo(&s_geo)) {
+        ESP_LOGW(TAG, "Geo-IP lookup failed — using last known offset/location");
     } else {
         /* No lookup result and nothing cached — writing an arbitrary local
          * time would be worse than keeping the (stale but honest) RTC. */
@@ -481,6 +595,7 @@ static bool sync_time_from_internet(void)
         return false;
     }
 
+    int offset_min = s_geo.offset_min;
     char tz[24];
     make_tz_string(tz, sizeof(tz), offset_min);
     setenv("TZ", tz, 1);
@@ -509,6 +624,68 @@ static bool sync_time_from_internet(void)
              rt.year, rt.month, rt.day, rt.hour, rt.minute, rt.second,
              offset_min / 60,
              offset_min < 0 ? -(offset_min % 60) : offset_min % 60);
+    return true;
+}
+
+/* ── Weather ────────────────────────────────────────────────────────── */
+
+/* WMO weather-code → short description (open-meteo's coding). */
+static const char *wmo_text(int code)
+{
+    switch (code) {
+    case 0:  return "Clear sky";
+    case 1:  return "Mainly clear";
+    case 2:  return "Partly cloudy";
+    case 3:  return "Overcast";
+    case 45: case 48: return "Fog";
+    case 51: case 53: case 55: case 56: case 57: return "Drizzle";
+    case 61: case 63: case 65: case 66: case 67: return "Rain";
+    case 71: case 73: case 75: case 77: return "Snow";
+    case 80: case 81: case 82: return "Rain showers";
+    case 85: case 86: return "Snow showers";
+    case 95: case 96: case 99: return "Thunderstorm";
+    default: return "—";
+    }
+}
+
+/* Current conditions from open-meteo.com (free, no API key) for the
+ * position in s_geo. */
+static bool fetch_weather(weather_t *w)
+{
+    memset(w, 0, sizeof(*w));
+    if (!s_geo.has_pos) return false;
+
+    char url[220];
+    snprintf(url, sizeof(url),
+        "https://api.open-meteo.com/v1/forecast"
+        "?latitude=%.4f&longitude=%.4f"
+        "&current=temperature_2m,weather_code,wind_speed_10m"
+        "&timezone=auto",
+        s_geo.lat, s_geo.lon);
+
+    static char resp[2048];
+    if (!http_get(url, resp, sizeof(resp))) {
+        ESP_LOGW(TAG, "Weather fetch failed");
+        return false;
+    }
+
+    /* The values we want live inside the "current":{...} object. */
+    const char *cur = strstr(resp, "\"current\":{");
+    if (!cur) return false;
+
+    float t = 0, wind = 0;
+    int code = 0;
+    if (!json_float(cur, "\"temperature_2m\":", &t)) return false;
+    json_int(cur, "\"weather_code\":", &code);
+    json_float(cur, "\"wind_speed_10m\":", &wind);
+
+    w->ok      = true;
+    w->temp_c  = t;
+    w->code    = code;
+    w->wind_kmh = wind;
+    ESP_LOGI(TAG, "Weather (%s): %.1f C, %s, wind %.0f km/h",
+             s_geo.city[0] ? s_geo.city : "unknown",
+             t, wmo_text(code), wind);
     return true;
 }
 
@@ -567,10 +744,14 @@ void app_main(void)
         if (rtc_ok && (rtc.year < 2024 || rtc.year > 2099)) rtc_ok = false;
     }
 
+    /* ── Outdoor weather for the dashboard ── */
+    weather_t weather = {0};
+    if (wifi_on) fetch_weather(&weather);
+
     /* ── Dashboard ── */
     int pct = battery_pct(bat_mv);
     lv_obj_t *dash = create_dashboard_screen(pct, temp_c, humidity, &rtc, rtc_ok,
-                                             bat_mv, wifi_on, wifi_ip);
+                                             bat_mv, wifi_on, wifi_ip, &weather);
     lv_screen_load(dash);
     if (s_setup_scr) { lv_obj_del(s_setup_scr); s_setup_scr = NULL; }
 
