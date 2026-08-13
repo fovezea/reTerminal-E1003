@@ -71,6 +71,11 @@ CONFIG_LV_FONT_MONTSERRAT_32=y
 CONFIG_LV_FONT_MONTSERRAT_40=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
 #
+# lwIP — allow several NTP servers (Chinese mirrors)
+#
+CONFIG_LWIP_SNTP_MAX_SERVERS=3
+
+#
 # Task watchdog — e-Paper ops are slow
 #
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=120

@@ -10,4 +10,8 @@ idf_component_register(
         spi_flash
         wifi_manager
         esp_timer
+        esp_http_client
+        esp-tls
+        lwip
+        nvs_flash
 )

@@ -1,12 +1,17 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdarg.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_psram.h"
 #include "esp_timer.h"
+#include "esp_http_client.h"
+#include "esp_sntp.h"
+#include "esp_crt_bundle.h"
+#include "nvs.h"
 #include "bsp.h"
 #include "it8951.h"
 #include "wifi_manager.h"
@@ -331,6 +336,182 @@ static lv_obj_t *create_dashboard_screen(int pct, float temp_c, float humidity,
     return scr;
 }
 
+/* ── Internet time sync ─────────────────────────────────────────────── */
+
+#define SNTP_SYNC_TIMEOUT_MS  20000
+#define TIME_NVS_NAMESPACE    "time"
+#define TIME_NVS_KEY_OFFSET   "utc_off"   /* last known UTC offset, minutes */
+
+/* Fetch `"<anchor>" ... "offset":<seconds>` from a geo-IP service.
+ * Auto-redirect is disabled so a captive portal that hijacks the request
+ * fails fast instead of dragging us into a TLS handshake. */
+static bool fetch_offset(const char *url, const char *anchor, int *offset_min)
+{
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .timeout_ms = 6000,
+        .disable_auto_redirect = true,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t cl = esp_http_client_init(&cfg);
+    if (!cl) return false;
+
+    static char resp[2048];
+    bool ok = false;
+    if (esp_http_client_open(cl, 0) == ESP_OK) {
+        esp_http_client_fetch_headers(cl);
+        if (esp_http_client_get_status_code(cl) == 200) {
+            int total = 0;
+            while (total < (int)sizeof(resp) - 1) {
+                int r = esp_http_client_read(cl, resp + total,
+                                             sizeof(resp) - 1 - total);
+                if (r <= 0) break;
+                total += r;
+            }
+            resp[total] = '\0';
+
+            const char *p = anchor ? strstr(resp, anchor) : resp;
+            if (p) p = strstr(p, "\"offset\":");
+            if (p) {
+                int sec = 0;
+                if (sscanf(p + 9, "%d", &sec) == 1) {
+                    *offset_min = sec / 60;
+                    ok = true;
+                }
+            }
+        }
+    }
+    esp_http_client_close(cl);
+    esp_http_client_cleanup(cl);
+    return ok;
+}
+
+/* Ask geo-IP services for the current UTC offset (daylight saving
+ * included) of our public IP, so the timezone follows us when we travel.
+ * Several sources are tried in order — reachability varies by country. */
+static bool geo_lookup_offset(int *offset_min)
+{
+    /* Plain HTTP; {"status":"success","offset":28800} */
+    if (fetch_offset("http://ip-api.com/json/?fields=status,offset",
+                     NULL, offset_min)) return true;
+    /* HTTPS (Let's Encrypt); {"timezone":{...,"offset":28800,...}} */
+    if (fetch_offset("https://ipwho.is/", "\"timezone\"", offset_min))
+        return true;
+    return false;
+}
+
+static void cache_tz_offset(int minutes)
+{
+    nvs_handle_t h;
+    if (nvs_open(TIME_NVS_NAMESPACE, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_i32(h, TIME_NVS_KEY_OFFSET, minutes);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static bool cached_tz_offset(int *minutes)
+{
+    nvs_handle_t h;
+    if (nvs_open(TIME_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    int32_t v = 0;
+    esp_err_t e = nvs_get_i32(h, TIME_NVS_KEY_OFFSET, &v);
+    nvs_close(h);
+    if (e != ESP_OK) return false;
+    *minutes = v;
+    return true;
+}
+
+/* POSIX TZ string from a UTC offset in minutes.  Note the sign flip:
+ * POSIX wants the value that, added to local time, gives UTC. */
+static void make_tz_string(char *tz, size_t len, int offset_min)
+{
+    int sign = (offset_min < 0) ? -1 : 1;
+    int abs_min = offset_min * sign;
+    int hh = abs_min / 60, mm = abs_min % 60;
+    if (mm) snprintf(tz, len, "<%s%02d%02d>%s%d:%02d",
+                     sign > 0 ? "+" : "-", hh, mm,
+                     sign > 0 ? "-" : "", hh, mm);
+    else    snprintf(tz, len, "<%s%02d>%s%d",
+                     sign > 0 ? "+" : "-", hh,
+                     sign > 0 ? "-" : "", hh);
+}
+
+/* Get UTC time via SNTP.  True if the time is valid afterwards.
+ * Uses Chinese NTP mirrors — pool.ntp.org is often unreachable there. */
+static bool sntp_sync(uint32_t timeout_ms)
+{
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "ntp.aliyun.com");
+    esp_sntp_setservername(1, "ntp.tencent.com");
+    esp_sntp_setservername(2, "cn.pool.ntp.org");
+    esp_sntp_init();
+
+    int64_t t0 = esp_timer_get_time();
+    for (;;) {
+        sntp_sync_status_t st = sntp_get_sync_status();
+        if (st == SNTP_SYNC_STATUS_COMPLETED) {
+            esp_sntp_stop();
+            return true;
+        }
+
+        if ((esp_timer_get_time() - t0) / 1000 >= timeout_ms) {
+            ESP_LOGW(TAG, "SNTP timed out (status %d)", (int)st);
+            esp_sntp_stop();
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));   /* lwIP retries internally */
+    }
+}
+
+/* Sync the clock from the internet: UTC from SNTP + local zone from a
+ * geo-IP lookup of our public IP (falls back to the last known offset,
+ * then to UTC).  Writes the result into the PCF8563 RTC. */
+static bool sync_time_from_internet(void)
+{
+    int offset_min;
+    if (geo_lookup_offset(&offset_min)) {
+        cache_tz_offset(offset_min);
+    } else if (cached_tz_offset(&offset_min)) {
+        ESP_LOGW(TAG, "Geo-IP lookup failed — using last known UTC offset");
+    } else {
+        /* No lookup result and nothing cached — writing an arbitrary local
+         * time would be worse than keeping the (stale but honest) RTC. */
+        ESP_LOGW(TAG, "Timezone unknown — RTC left unchanged");
+        return false;
+    }
+
+    char tz[24];
+    make_tz_string(tz, sizeof(tz), offset_min);
+    setenv("TZ", tz, 1);
+    tzset();
+
+    if (!sntp_sync(SNTP_SYNC_TIMEOUT_MS)) {
+        ESP_LOGW(TAG, "SNTP sync failed — RTC not updated");
+        return false;
+    }
+
+    time_t now;
+    struct tm t;
+    time(&now);
+    localtime_r(&now, &t);
+
+    bsp_rtc_time_t rt = {
+        .year = t.tm_year + 1900, .month = t.tm_mon + 1, .day = t.tm_mday,
+        .hour = t.tm_hour, .minute = t.tm_min, .second = t.tm_sec,
+    };
+    if (bsp_rtc_set_time(&rt) != ESP_OK) {
+        ESP_LOGW(TAG, "bsp_rtc_set_time failed");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "RTC set from NTP: %04d-%02d-%02d %02d:%02d:%02d (UTC%+03d:%02d)",
+             rt.year, rt.month, rt.day, rt.hour, rt.minute, rt.second,
+             offset_min / 60,
+             offset_min < 0 ? -(offset_min % 60) : offset_min % 60);
+    return true;
+}
+
 /* ══════════════════════════════════════════════════════════════════════
  * Main
  * ══════════════════════════════════════════════════════════════════════ */
@@ -379,6 +560,12 @@ void app_main(void)
 
     char wifi_ip[16] = {0};
     if (wifi_on) wifi_mgr_get_ip_str(wifi_ip, sizeof(wifi_ip));
+
+    /* ── Time: sync from the internet and update the RTC ── */
+    if (wifi_on && sync_time_from_internet()) {
+        rtc_ok = (bsp_rtc_read_time(&rtc) == ESP_OK);
+        if (rtc_ok && (rtc.year < 2024 || rtc.year > 2099)) rtc_ok = false;
+    }
 
     /* ── Dashboard ── */
     int pct = battery_pct(bat_mv);

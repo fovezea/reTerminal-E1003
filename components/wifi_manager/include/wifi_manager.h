@@ -2,10 +2,13 @@
  * wifi_manager.h — WiFi provisioning & connection manager
  *
  * Provides the "usual" provisioning flow for the reTerminal E1003:
- *   - Load saved credentials from NVS and connect as a station (STA).
- *   - If there are none, or the saved network can't be reached, run a
+ *   - Load a LIST of saved credentials from NVS (most recently used first),
+ *     scan, and connect as a station (STA) to whichever saved network is
+ *     in range — like a phone remembers several networks.
+ *   - If there are none, or no saved network can be reached, run a
  *     SoftAP + web config portal so the user can enter SSID + password.
- *   - Credentials are stored in NVS and reused on the next boot.
+ *   - Newly submitted credentials are added to the list (never overwrite
+ *     the others), so the device keeps remembering every network.
  *
  * The component is self-contained: it owns NVS access, the WiFi driver,
  * the SoftAP, and the HTTP server.  The application only orchestrates it
@@ -40,14 +43,16 @@ esp_err_t wifi_mgr_init(void);
 bool wifi_mgr_has_credentials(void);
 
 /**
- * @brief Connect as a station using the saved NVS credentials.
+ * @brief Connect as a station to the best available saved network.
  *
- * Blocks up to timeout_ms, retrying internally.  Returns true once the
- * station has obtained an IP address.  Returns false if the SSID is not
- * found, authentication fails, or the timeout elapses — in which case the
- * caller should fall back to wifi_mgr_portal_start().
+ * Scans for available APs, then tries each saved network in priority order
+ * (most recently used first), skipping ones that are out of range.  Each
+ * attempt blocks up to timeout_ms, retrying internally.  Returns true once
+ * the station has obtained an IP address.  Returns false if no saved
+ * network can be reached — in which case the caller should fall back to
+ * wifi_mgr_portal_start().
  *
- * @param timeout_ms  Overall time budget for the connection attempt.
+ * @param timeout_ms  Time budget for each connection attempt.
  */
 bool wifi_mgr_connect_saved(uint32_t timeout_ms);
 
@@ -55,7 +60,9 @@ bool wifi_mgr_connect_saved(uint32_t timeout_ms);
  * @brief Connect as a station to an explicit SSID/password.
  *
  * Used after the user submits credentials via the portal.  On success the
- * credentials are saved to NVS so the next boot connects automatically.
+ * credentials are added to the saved network list (existing entries are
+ * kept) and become the top priority, so the next boot connects to them
+ * automatically while still remembering the other networks.
  *
  * @param ssid       Network name (NUL-terminated).
  * @param pass       Network password ("" for open networks).

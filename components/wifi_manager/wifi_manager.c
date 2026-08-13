@@ -2,11 +2,14 @@
  * wifi_manager.c — WiFi provisioning & connection manager
  *
  * See wifi_manager.h for the intended flow.  Summary:
- *   - Credentials live in NVS (namespace "wifi", keys "ssid"/"pass").
- *   - wifi_mgr_connect_saved() tries the stored network as a station.
+ *   - Up to WIFI_MGR_MAX_NETWORKS credentials live in NVS (namespace "wifi"),
+ *     kept in most-recently-used order (index 0 = highest priority).
+ *   - wifi_mgr_connect_saved() scans, then connects to whichever saved
+ *     network is in range (highest priority first) — like a phone.
  *   - wifi_mgr_portal_start() runs a SoftAP + web portal for entering creds.
  *   - wifi_mgr_connect_to() connects with freshly submitted creds and, on
- *     success, persists them so the next boot connects automatically.
+ *     success, stores them so the next boot connects automatically.
+ *   - Legacy single-network entries ("ssid"/"pass") are migrated on load.
  */
 
 #include <string.h>
@@ -37,9 +40,13 @@ static const char *TAG = "wifi_mgr";
 #define WIFI_MGR_AP_PASS   "reterminal"      /* WPA2-PSK needs >= 8 chars */
 
 #define NVS_NAMESPACE      "wifi"
+#define NVS_KEY_COUNT      "netcount"     /* u8: how many networks are saved */
+#define NVS_KEY_NET_FMT    "net%d"        /* blob per network, 0 = priority */
+/* Legacy (single-network) keys — migrated into the list on first load. */
 #define NVS_KEY_SSID       "ssid"
 #define NVS_KEY_PASS       "pass"
 
+#define WIFI_MGR_MAX_NETWORKS 8
 #define CONNECT_MAX_RETRY  3
 #define SCAN_MAX_AP        12
 #define PORTAL_MAX_CLIENTS 4
@@ -53,17 +60,23 @@ static const char *TAG = "wifi_mgr";
 extern const char index_html_start[] asm("_binary_index_html_start");
 
 /* ------------------------------------------------------------------ state */
+typedef struct {
+    char ssid[WIFI_MGR_MAX_SSID];
+    char pass[WIFI_MGR_MAX_PASS];
+} wifi_net_t;
+
 static bool                 s_inited    = false;
 static bool                 s_connected = false;
-static bool                 s_has_creds = false;
 static int                  s_retry     = 0;
 static EventGroupHandle_t   s_evt       = NULL;
 static esp_netif_t         *s_netif_sta = NULL;
 static esp_netif_t         *s_netif_ap  = NULL;
 static httpd_handle_t       s_httpd     = NULL;
 
-static char s_saved_ssid[WIFI_MGR_MAX_SSID];
-static char s_saved_pass[WIFI_MGR_MAX_PASS];
+/* Saved networks, most-recently-used first (index 0 is tried first). */
+static wifi_net_t s_networks[WIFI_MGR_MAX_NETWORKS];
+static int        s_net_count = 0;
+
 static char s_portal_ssid[WIFI_MGR_MAX_SSID];
 static char s_portal_pass[WIFI_MGR_MAX_PASS];
 
@@ -74,33 +87,96 @@ static wifi_ap_record_t s_scan_cache[SCAN_MAX_AP];
 static int              s_scan_count = 0;
 
 /* ===================================================================== NVS */
-static bool nvs_load(char *ssid, size_t ssid_len, char *pass, size_t pass_len)
+
+/* Load the network list.  Falls back to the legacy single "ssid"/"pass"
+ * keys so credentials saved by older firmware carry over. */
+static void nvs_load_networks(void)
 {
+    s_net_count = 0;
     nvs_handle_t h;
-    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return;
 
-    size_t sl = ssid_len, pl = pass_len;
-    esp_err_t e1 = nvs_get_str(h, NVS_KEY_SSID, ssid, &sl);
-    esp_err_t e2 = nvs_get_str(h, NVS_KEY_PASS, pass, &pl);
+    uint8_t count = 0;
+    if (nvs_get_u8(h, NVS_KEY_COUNT, &count) == ESP_OK && count > 0) {
+        if (count > WIFI_MGR_MAX_NETWORKS) count = WIFI_MGR_MAX_NETWORKS;
+        char key[16];
+        for (int i = 0; i < count; i++) {
+            wifi_net_t net;
+            size_t len = sizeof(net);
+            snprintf(key, sizeof(key), NVS_KEY_NET_FMT, i);
+            if (nvs_get_blob(h, key, &net, &len) != ESP_OK) continue;
+            net.ssid[WIFI_MGR_MAX_SSID - 1] = '\0';
+            net.pass[WIFI_MGR_MAX_PASS - 1] = '\0';
+            if (net.ssid[0]) s_networks[s_net_count++] = net;
+        }
+    } else {
+        /* Legacy single-network layout */
+        char ssid[WIFI_MGR_MAX_SSID] = {0};
+        char pass[WIFI_MGR_MAX_PASS] = {0};
+        size_t sl = sizeof(ssid), pl = sizeof(pass);
+        esp_err_t e = nvs_get_str(h, NVS_KEY_SSID, ssid, &sl);
+        nvs_get_str(h, NVS_KEY_PASS, pass, &pl);   /* may legitimately fail */
+        if (e == ESP_OK && ssid[0]) {
+            strncpy(s_networks[0].ssid, ssid, WIFI_MGR_MAX_SSID - 1);
+            strncpy(s_networks[0].pass, pass, WIFI_MGR_MAX_PASS - 1);
+            s_net_count = 1;
+        }
+    }
     nvs_close(h);
-
-    if (e1 != ESP_OK || ssid[0] == '\0') return false;
-    if (e2 != ESP_OK) pass[0] = '\0';   /* open network / no password saved */
-    return true;
 }
 
-static void nvs_save(const char *ssid, const char *pass)
+static void nvs_save_networks(void)
 {
     nvs_handle_t h;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h) != ESP_OK) {
         ESP_LOGE(TAG, "nvs_open(RW) failed");
         return;
     }
-    nvs_set_str(h, NVS_KEY_SSID, ssid);
-    nvs_set_str(h, NVS_KEY_PASS, pass);
+    nvs_set_u8(h, NVS_KEY_COUNT, (uint8_t)s_net_count);
+    char key[16];
+    for (int i = 0; i < s_net_count; i++) {
+        snprintf(key, sizeof(key), NVS_KEY_NET_FMT, i);
+        nvs_set_blob(h, key, &s_networks[i], sizeof(wifi_net_t));
+    }
     esp_err_t err = nvs_commit(h);
     nvs_close(h);
-    ESP_LOGI(TAG, "Saved credentials to NVS (%s)", esp_err_to_name(err));
+    ESP_LOGI(TAG, "Saved %d network(s) to NVS (%s)", s_net_count, esp_err_to_name(err));
+}
+
+/* Move network `index` to the front (most recently used). */
+static void promote_network(int index)
+{
+    if (index <= 0 || index >= s_net_count) return;
+    wifi_net_t tmp = s_networks[index];
+    memmove(&s_networks[1], &s_networks[0], (size_t)index * sizeof(wifi_net_t));
+    s_networks[0] = tmp;
+}
+
+/* Insert or update a network and make it the top-priority one. */
+static void remember_network(const char *ssid, const char *pass)
+{
+    for (int i = 0; i < s_net_count; i++) {
+        if (strcmp(s_networks[i].ssid, ssid) == 0) {
+            strncpy(s_networks[i].pass, pass ? pass : "", WIFI_MGR_MAX_PASS - 1);
+            s_networks[i].pass[WIFI_MGR_MAX_PASS - 1] = '\0';
+            promote_network(i);
+            return;
+        }
+    }
+    if (s_net_count >= WIFI_MGR_MAX_NETWORKS) s_net_count--;  /* drop lowest priority */
+    memmove(&s_networks[1], &s_networks[0], (size_t)s_net_count * sizeof(wifi_net_t));
+    strncpy(s_networks[0].ssid, ssid, WIFI_MGR_MAX_SSID - 1);
+    s_networks[0].ssid[WIFI_MGR_MAX_SSID - 1] = '\0';
+    strncpy(s_networks[0].pass, pass ? pass : "", WIFI_MGR_MAX_PASS - 1);
+    s_networks[0].pass[WIFI_MGR_MAX_PASS - 1] = '\0';
+    s_net_count++;
+}
+
+static bool ssid_in_scan(const char *ssid)
+{
+    for (int i = 0; i < s_scan_count; i++)
+        if (strcmp((const char *)s_scan_cache[i].ssid, ssid) == 0) return true;
+    return false;
 }
 
 /* ============================================================ event handler */
@@ -345,10 +421,12 @@ esp_err_t wifi_mgr_init(void)
         nvs_flash_init();
     }
 
-    s_has_creds = nvs_load(s_saved_ssid, sizeof(s_saved_ssid),
-                           s_saved_pass, sizeof(s_saved_pass));
-    if (s_has_creds) ESP_LOGI(TAG, "Saved network: \"%s\"", s_saved_ssid);
-    else             ESP_LOGI(TAG, "No saved WiFi credentials");
+    nvs_load_networks();
+    if (s_net_count > 0)
+        ESP_LOGI(TAG, "%d saved network(s), priority: \"%s\"",
+                 s_net_count, s_networks[0].ssid);
+    else
+        ESP_LOGI(TAG, "No saved WiFi credentials");
 
     if (!s_evt) s_evt = xEventGroupCreate();
 
@@ -370,18 +448,37 @@ esp_err_t wifi_mgr_init(void)
     return ESP_OK;
 }
 
-bool wifi_mgr_has_credentials(void) { return s_has_creds; }
+bool wifi_mgr_has_credentials(void) { return s_net_count > 0; }
 
 bool wifi_mgr_connect_saved(uint32_t timeout_ms)
 {
-    if (!s_inited || !s_has_creds) return false;
+    if (!s_inited || s_net_count == 0) return false;
 
     esp_wifi_stop();
     esp_wifi_set_mode(WIFI_MODE_STA);
     esp_wifi_start();
 
-    ESP_LOGI(TAG, "Connecting to saved network \"%s\" ...", s_saved_ssid);
-    return sta_connect_internal(s_saved_ssid, s_saved_pass, timeout_ms);
+    /* Find out which saved networks are actually in range. */
+    vTaskDelay(pdMS_TO_TICKS(200));
+    do_scan_cache();
+
+    for (int i = 0; i < s_net_count; i++) {
+        /* Skip networks the scan didn't see.  If the scan itself failed
+         * (s_scan_count == 0), try every saved network in priority order. */
+        if (s_scan_count > 0 && !ssid_in_scan(s_networks[i].ssid)) {
+            ESP_LOGI(TAG, "Saved network \"%s\" not in range", s_networks[i].ssid);
+            continue;
+        }
+        ESP_LOGI(TAG, "Connecting to saved network \"%s\" ...", s_networks[i].ssid);
+        if (sta_connect_internal(s_networks[i].ssid, s_networks[i].pass, timeout_ms)) {
+            if (i > 0) {                 /* promote the winner for next boot */
+                promote_network(i);
+                nvs_save_networks();
+            }
+            return true;
+        }
+    }
+    return false;
 }
 
 bool wifi_mgr_connect_to(const char *ssid, const char *pass, uint32_t timeout_ms)
@@ -400,10 +497,8 @@ bool wifi_mgr_connect_to(const char *ssid, const char *pass, uint32_t timeout_ms
     ESP_LOGI(TAG, "Connecting to \"%s\" ...", ssid);
     bool ok = sta_connect_internal(ssid, pass ? pass : "", timeout_ms);
     if (ok) {
-        nvs_save(ssid, pass ? pass : "");
-        strncpy(s_saved_ssid, ssid, sizeof(s_saved_ssid) - 1);
-        strncpy(s_saved_pass, pass ? pass : "", sizeof(s_saved_pass) - 1);
-        s_has_creds = true;
+        remember_network(ssid, pass ? pass : "");
+        nvs_save_networks();
     }
     return ok;
 }
